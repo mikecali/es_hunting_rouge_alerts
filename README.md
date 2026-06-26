@@ -101,12 +101,12 @@ AND kibana.saved_objects.type_id  =  ".es-query"
                               │   [OPS] ES Query Rogue Alert Hunter      │
                               │   Kibana Dashboard — auto-refresh 30s    │
                               │                                          │
-                              │  • Detections over time (bar chart)      │
+                              │  • Detections over time (Lens bar chart) │
                               │  • Worst single execution (ms metric)    │
                               │  • Total / Critical / Warning counts     │
                               │  • Current offenders table               │
                               │    (name, creator, tags, severity)       │
-                              │  • All rule duration histogram           │
+                              │  • All rule duration histogram (Lens)    │
                               │  • Rule health scorecard                 │
                               └─────────────────────────────────────────┘
 ```
@@ -120,7 +120,52 @@ AND kibana.saved_objects.type_id  =  ".es-query"
 | Creator-based allowlist | ❌ | ❌ | ❌ | ❌ |
 | **Duration-based (this solution)** | ✅ | ✅ | ✅ | ✅ |
 
-The `_TEST_Legit_Looking_Rule` test case validated this — a rule with tags `monitoring, ops`, created by a known account, with a reasonable-sounding name was still detected because its execution time crossed 1 second.
+The `_TEST_Legit_Looking_Rule` test case validated this — a rule with tags `monitoring, ops`, created by a known account, with a reasonable-sounding name was still detected because its execution time crossed 1 second. Duration is an honest signal: if it's slow, it's consuming resources regardless of intent.
+
+---
+
+## Dashboard
+
+The `[OPS] ES Query Rogue Alert Hunter` dashboard has 8 panels across 3 rows, auto-refreshing every 30 seconds with a default 24-hour time window.
+
+**Row 1 — Summary metrics**
+
+| Panel | Type | Data source | What it shows |
+|---|---|---|---|
+| Rogue Detections Over Time | Lens bar chart (stacked) | `rogue-alert-detections` | Warning vs critical detections over time at 30-minute intervals |
+| Worst Single Execution (ms) | Metric (colour-coded) | `rogue-alert-detections` | Max `detection.duration_ms` — green <1s, amber 1–5s, red >5s |
+| Total Detections (24h) | Metric | `rogue-alert-detections` | Count of all detection documents in the time window |
+| Critical Detections (>5s) | Metric (colour-coded) | `rogue-alert-detections` | Count where `detection.severity = critical` — green if 0, red if any |
+| Warning Detections (>1s) | Metric (colour-coded) | `rogue-alert-detections` | Count where `detection.severity = warning` — green if 0, amber if any |
+
+**Row 2 — Offenders table**
+
+| Panel | Type | Data source | What it shows |
+|---|---|---|---|
+| Current Offenders — Enriched Detection Table | Table | `rogue-alert-detections` | One row per offending rule: Rule ID, name, creator, severity, schedule, tags, detection count, max duration. Sorted by max duration descending. |
+
+**Row 3 — Cluster-level signals**
+
+| Panel | Type | Data source | What it shows |
+|---|---|---|---|
+| All .es-query Rule Duration Distribution | Lens bar chart | `.kibana-event-log*` | Execution time distribution in 4 buckets: 0–1s, 1–2s, 2–5s, >5s. Legitimate rules cluster entirely in 0–1s. Outliers are rogues. |
+| Rule Health Scorecard | Table | `.kibana-event-log*` | All `.es-query` rules ranked by max execution duration, with execution count and outcome. |
+
+> **Note on chart panels:** Panels 1 and 7 use Kibana **Lens** (`lnsXY`). The legacy `histogram` visualization type does not render in Kibana 9.x. If rebuilding the dashboard, use the Lens editor for any time-series or distribution charts.
+
+**Live dashboard state (tested on ES/Kibana 9.2.2):**
+
+```
+Total detections: 49     Warning: 49     Critical: 0
+Worst execution:  1,336ms (amber — warning tier)
+
+Offenders table:
+  Elasticsearch query rule      rouge          18 detections   1,336ms
+  _TEST_ROGUE_Critical_Tier     _TEST          11 detections   1,285ms
+  Elasticsearch query rule      rouge_alert    11 detections   1,281ms
+  _TEST_Legit_Looking_Rule      monitoring,ops  7 detections   1,102ms
+  Rogue Alerts - 7days Metrics  rogue           1 detection    1,078ms
+```
 
 ---
 
@@ -192,6 +237,7 @@ Rule execution duration (ms)
 - Rules scanning broad index patterns (`logs-*`, `metrics-*`) without filters
 - Rules on tight schedules (1m) with wide windows (24h+)
 - Any rule from any account — creator is irrelevant to detection
+- Rules that look legitimate by name and tags but are slow in practice
 
 ### Not Detected ❌
 - Rules that run fast but generate excessive actions (action flood)
@@ -222,7 +268,12 @@ Before creating anything, verify you have at least 2 free shards:
 GET _cluster/stats?filter_path=indices.shards.total
 ```
 
-If at or near 5000, clean up unused indices before proceeding. Do not set `cluster.max_shards_per_node` higher without understanding the memory impact.
+If at or near 5000, clean up unused indices before proceeding. The default cluster limit is `cluster.max_shards_per_node * node_count`. Do not raise this limit without understanding the JVM heap impact — each shard costs approximately 10KB of heap.
+
+Common shard waste patterns to clean up first:
+- Empty Universal Profiling indices (`.profiling-*`) — `DELETE .profiling-*`
+- Empty APM rollover tails (0-doc backing indices) — identify with `GET _cat/indices?v&s=docs.count:asc&h=index,docs.count`
+- Stale ephemeral pod data streams (e.g. `logs-apm.app.virt_launcher_*`) — `DELETE _data_stream/logs-apm.app.virt_launcher_*`
 
 ### Step 2 — Create the detections index
 
@@ -515,28 +566,14 @@ Copy both `id` values from the responses — you need them for Step 6.
 
 ### Step 6 — Deploy the dashboard
 
-Replace `<DETECTIONS_DV_ID>` and `<EVENTLOG_DV_ID>` with your data view IDs from Step 5, then run:
+Use `dashboard_payload.json` from this repository. Replace the two placeholder data view IDs with your IDs from Step 5, then run:
 
-```json
-POST kbn:/api/saved_objects/dashboard/ops-rogue-alert-hunter-dash
-{
-  "attributes": {
-    "title": "[OPS] ES Query Rogue Alert Hunter",
-    "description": "Behavioural detection for rogue .es-query Kibana rules. Powered by ops-rogue-alert-hunter Watcher (runs every 5m).",
-    "timeRestore": true,
-    "timeFrom": "now-24h",
-    "timeTo": "now",
-    "refreshInterval": { "pause": false, "value": 30000 },
-    "kibanaSavedObjectMeta": {
-      "searchSourceJSON": "{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
-    },
-    "optionsJSON": "{\"useMargins\":true,\"syncColors\":false,\"hidePanelTitles\":false}"
-  },
-  "references": []
-}
+```
+PUT kbn:/api/saved_objects/dashboard/ops-rogue-alert-hunter-dash
+<contents of dashboard_payload.json>
 ```
 
-> **Note:** For the full panel configuration, see [`dashboard_payload.json`](./dashboard_payload.json) in this repository. The full payload includes 8 panels with pre-wired aggregations. Replace the two data view ID placeholders before importing.
+The payload uses Kibana **Lens** (`lnsXY`) for the two chart panels (Detections Over Time and Duration Distribution). The legacy `histogram` visualization type does not render in Kibana 9.x — do not substitute it.
 
 ### Step 7 — Open the dashboard
 
@@ -727,6 +764,7 @@ DELETE _watcher/watch/ops-rogue-alert-hunter
 | No auto-remediation | The Watcher detects and reports — it never disables or cancels rules. Human review is required before any action. This is intentional |
 | `.es-query` rules only | Other rule types (`slo.rules.burnRate`, `.index-threshold`, ML rules) are not in scope. Extend by modifying the `type_id` filter |
 | Watcher licence | Requires Elastic Platinum or Enterprise licence |
+| Duration alone is not causation | A rule that is slow due to cluster degradation (GC, hot threads) will also be detected. Correlate with node CPU and hot threads before blaming the rule |
 
 ---
 
@@ -735,7 +773,7 @@ DELETE _watcher/watch/ops-rogue-alert-hunter
 | File | Purpose |
 |---|---|
 | `README.md` | This document |
-| `dashboard_payload.json` | Full Kibana dashboard saved object (8 panels, replace data view IDs before import) |
+| `dashboard_payload.json` | Full Kibana dashboard saved object — 8 panels using Lens for charts, legacy visualization for metrics and tables. Replace data view IDs before deploying. |
 | `watcher.json` | Standalone Watcher definition for CI/CD or IaC deployment |
 
 ---
@@ -760,7 +798,7 @@ To validate detection after deployment, create these rules in **Stack Management
 - **Schedule:** 1 minute
 - **Exclude previous runs:** unchecked
 
-### Test 3 — Should NOT trigger (control)
+### Test 3 — Control (should NOT appear in detections if cluster is fast)
 - **Name:** `_TEST_Legit_Control`
 - **Index:** `logs-*`
 - **Query:** specific filter (not empty)
@@ -768,9 +806,9 @@ To validate detection after deployment, create these rules in **Stack Management
 - **Schedule:** 5 minutes
 - **Exclude previous runs:** checked
 
-Wait 5 minutes, trigger the Watcher manually, then verify Test 1 and 2 appear in `rogue-alert-detections` and Test 3 does not.
+Wait 5 minutes, trigger the Watcher manually, then verify Test 1 and 2 appear in `rogue-alert-detections`.
 
-> **Note:** In practice, even a narrow-window rule can appear if the underlying index is large enough. Duration is an honest signal — if it's slow, it's consuming resources.
+> **Note:** Test 3 may still appear if the underlying `logs-*` index is large — even a narrow window over a large dataset can exceed 1 second. This is correct detection behaviour, not a false positive. Duration is an honest signal: if the query is slow, it is consuming resources.
 
 ---
 
@@ -786,4 +824,5 @@ Wait 5 minutes, trigger the Watcher manually, then verify Test 1 and 2 appear in
 ---
 
 *Tested on Elasticsearch 9.2.2 / Kibana 9.2.2. Compatible with 9.x.*
+
 
