@@ -1,0 +1,120 @@
+{
+  "_comment": "Deploy with: PUT _watcher/watch/ops-rogue-alert-hunter",
+  "_comment_thresholds": "warning: >1000ms, critical: >5000ms — tune per cluster",
+  "trigger": {
+    "schedule": { "interval": "5m" }
+  },
+  "input": {
+    "chain": {
+      "inputs": [
+        {
+          "executions": {
+            "search": {
+              "request": {
+                "indices": [".kibana-event-log*"],
+                "body": {
+                  "size": 0,
+                  "query": {
+                    "bool": {
+                      "filter": [
+                        { "term": { "event.provider": "alerting" } },
+                        { "term": { "event.action": "execute" } },
+                        { "range": { "@timestamp": { "gte": "now-5m" } } },
+                        { "range": { "event.duration": { "gt": 1000000000 } } }
+                      ],
+                      "must": [
+                        {
+                          "nested": {
+                            "path": "kibana.saved_objects",
+                            "query": {
+                              "term": { "kibana.saved_objects.type_id": ".es-query" }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "aggs": {
+                    "by_rule": {
+                      "nested": { "path": "kibana.saved_objects" },
+                      "aggs": {
+                        "rule_id": {
+                          "terms": { "field": "kibana.saved_objects.id", "size": 50 },
+                          "aggs": {
+                            "back_to_root": {
+                              "reverse_nested": {},
+                              "aggs": {
+                                "max_duration":    { "max":          { "field": "event.duration" } },
+                                "execution_count": { "value_count":  { "field": "event.duration" } },
+                                "last_execution":  { "max":          { "field": "@timestamp" } }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "rule_metadata": {
+            "search": {
+              "request": {
+                "indices": [".kibana_alerting_cases_9*"],
+                "body": {
+                  "size": 100,
+                  "query": {
+                    "bool": {
+                      "must": [
+                        { "term": { "type": "alert" } },
+                        { "term": { "alert.alertTypeId": ".es-query" } }
+                      ]
+                    }
+                  },
+                  "_source": [
+                    "alert.name",
+                    "alert.tags",
+                    "alert.createdBy",
+                    "alert.createdAt",
+                    "alert.schedule",
+                    "alert.params.timeWindowSize",
+                    "alert.params.timeWindowUnit",
+                    "alert.params.size",
+                    "alert.params.excludeHitsFromPreviousRun"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "condition": {
+    "script": {
+      "source": "return ctx.payload.executions.aggregations.by_rule.rule_id.buckets.size() > 0"
+    }
+  },
+  "transform": {
+    "script": {
+      "lang": "painless",
+      "source": "def docs = []; def metaHits = ctx.payload.rule_metadata.hits.hits; for (def bucket : ctx.payload.executions.aggregations.by_rule.rule_id.buckets) { def ruleId = bucket.key; def maxDurationNs = bucket.back_to_root.max_duration.value; def maxDurationMs = (long)(maxDurationNs / 1000000); def maxDurationS = maxDurationNs / 1000000000.0; def execCount = bucket.back_to_root.execution_count.value; def lastExec = bucket.back_to_root.last_execution.value_as_string; def severity = maxDurationMs >= 5000 ? 'critical' : 'warning'; def ruleName = ruleId; def createdBy = 'unknown'; def createdAt = null; def tags = []; def schedule = '1m'; def windowSize = 0; def windowUnit = 'h'; def resultSize = 0; def excludePrev = false; for (def hit : metaHits) { def hitId = hit._id.replace('alert:', ''); if (hitId == ruleId) { def a = hit._source.alert; ruleName = a.name; createdBy = a.containsKey('createdBy') ? a.createdBy : 'unknown'; createdAt = a.containsKey('createdAt') ? a.createdAt : null; tags = a.containsKey('tags') ? a.tags : []; schedule = a.containsKey('schedule') ? a.schedule.interval : '1m'; if (a.containsKey('params')) { windowSize = a.params.containsKey('timeWindowSize') ? a.params.timeWindowSize : 0; windowUnit = a.params.containsKey('timeWindowUnit') ? a.params.timeWindowUnit : 'h'; resultSize = a.params.containsKey('size') ? a.params.size : 0; excludePrev = a.params.containsKey('excludeHitsFromPreviousRun') ? a.params.excludeHitsFromPreviousRun : false; } break; } } def doc = ['@timestamp': ctx.execution_time, 'rule.id': ruleId, 'rule.name': ruleName, 'rule.type': '.es-query', 'rule.tags': tags, 'rule.created_by': createdBy, 'rule.schedule': schedule, 'detection.duration_ms': maxDurationMs, 'detection.duration_s': maxDurationS, 'detection.severity': severity, 'detection.threshold_ms': severity == 'critical' ? 5000 : 1000, 'detection.execution_time': lastExec, 'detection.executions_in_window': execCount, 'detection.window_size_h': windowSize, 'detection.excludes_previous_runs': excludePrev, 'detection.result_size': resultSize]; if (createdAt != null) { doc['rule.created_at'] = createdAt; } docs.add(doc); } return [ '_doc': docs ];"
+    }
+  },
+  "actions": {
+    "index_detections": {
+      "foreach": "ctx.payload._doc",
+      "index": {
+        "index": "rogue-alert-detections"
+      }
+    },
+    "log_detections": {
+      "logging": {
+        "text": "[OPS] Rogue alert detected: {{ctx.payload._doc}}"
+      }
+    }
+  }
+}
