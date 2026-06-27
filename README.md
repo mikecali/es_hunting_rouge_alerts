@@ -106,7 +106,6 @@ AND kibana.saved_objects.type_id  =  ".es-query"
                               │  • Total / Critical / Warning counts     │
                               │  • Current offenders table               │
                               │    (name, creator, tags, severity)       │
-                              │  • All rule duration histogram (Lens)    │
                               │  • Rule health scorecard                 │
                               └─────────────────────────────────────────┘
 ```
@@ -126,7 +125,7 @@ The `_TEST_Legit_Looking_Rule` test case validated this — a rule with tags `mo
 
 ## Dashboard
 
-The `[OPS] ES Query Rogue Alert Hunter` dashboard has 8 panels across 3 rows, auto-refreshing every 30 seconds with a default 24-hour time window.
+The `[OPS] ES Query Rogue Alert Hunter` dashboard has 7 panels across 3 rows, auto-refreshing every 30 seconds with a default 24-hour time window.
 
 **Row 1 — Summary metrics**
 
@@ -148,10 +147,9 @@ The `[OPS] ES Query Rogue Alert Hunter` dashboard has 8 panels across 3 rows, au
 
 | Panel | Type | Data source | What it shows |
 |---|---|---|---|
-| All .es-query Rule Duration Distribution | Lens bar chart | `.kibana-event-log*` | Execution time distribution in 4 buckets: 0–1s, 1–2s, 2–5s, >5s. Legitimate rules cluster entirely in 0–1s. Outliers are rogues. |
 | Rule Health Scorecard | Table | `.kibana-event-log*` | All `.es-query` rules ranked by max execution duration, with execution count and outcome. |
 
-> **Note on chart panels:** Panels 1 and 7 use Kibana **Lens** (`lnsXY`). The legacy `histogram` visualization type does not render in Kibana 9.x. If rebuilding the dashboard, use the Lens editor for any time-series or distribution charts.
+> **Note on chart panels:** Panel 1 (Detections Over Time) uses Kibana **Lens** (`lnsXY`) and is created as a saved Lens object then added to the dashboard via the Visualize Library. The legacy `histogram` visualization type does not render in Kibana 9.x.
 
 **Live dashboard state (tested on ES/Kibana 9.2.2):**
 
@@ -573,7 +571,7 @@ PUT kbn:/api/saved_objects/dashboard/ops-rogue-alert-hunter-dash
 <contents of dashboard_payload.json>
 ```
 
-The payload uses Kibana **Lens** (`lnsXY`) for the two chart panels (Detections Over Time and Duration Distribution). The legacy `histogram` visualization type does not render in Kibana 9.x — do not substitute it.
+The payload includes Panel 1 (Detections Over Time) as a saved Lens object (`ops-rogue-detections-over-time`). Create this via `POST kbn:/api/saved_objects/lens/ops-rogue-detections-over-time` before importing the dashboard, then add it to the dashboard via Visualize Library. The legacy `histogram` visualization type does not render in Kibana 9.x.
 
 ### Step 7 — Open the dashboard
 
@@ -773,7 +771,7 @@ DELETE _watcher/watch/ops-rogue-alert-hunter
 | File | Purpose |
 |---|---|
 | `README.md` | This document |
-| `dashboard_payload.json` | Full Kibana dashboard saved object — 8 panels using Lens for charts, legacy visualization for metrics and tables. Replace data view IDs before deploying. |
+| `dashboard_payload.json` | Full Kibana dashboard saved object — 7 panels. Panel 1 (Detections Over Time) references a saved Lens object. Replace data view IDs before deploying. |
 | `watcher.json` | Standalone Watcher definition for CI/CD or IaC deployment |
 
 ---
