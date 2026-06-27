@@ -771,7 +771,7 @@ DELETE _watcher/watch/ops-rogue-alert-hunter
 | File | Purpose |
 |---|---|
 | `README.md` | This document |
-| `dashboard_payload.json` | Full Kibana dashboard saved object — 7 panels. Panel 1 (Detections Over Time) references a saved Lens object. Replace data view IDs before deploying. |
+| `dashboard creation steps` | Full Kibana dashboard saved object — 7 panels. Panel 1 (Detections Over Time) references a saved Lens object. Replace data view IDs before deploying. |
 | `watcher.json` | Standalone Watcher definition for CI/CD or IaC deployment |
 
 ---
