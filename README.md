@@ -266,12 +266,6 @@ Before creating anything, verify you have at least 2 free shards:
 GET _cluster/stats?filter_path=indices.shards.total
 ```
 
-If at or near 5000, clean up unused indices before proceeding. The default cluster limit is `cluster.max_shards_per_node * node_count`. Do not raise this limit without understanding the JVM heap impact — each shard costs approximately 10KB of heap.
-
-Common shard waste patterns to clean up first:
-- Empty Universal Profiling indices (`.profiling-*`) — `DELETE .profiling-*`
-- Empty APM rollover tails (0-doc backing indices) — identify with `GET _cat/indices?v&s=docs.count:asc&h=index,docs.count`
-- Stale ephemeral pod data streams (e.g. `logs-apm.app.virt_launcher_*`) — `DELETE _data_stream/logs-apm.app.virt_launcher_*`
 
 ### Step 2 — Create the detections index
 
