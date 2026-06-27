@@ -1,0 +1,172 @@
+# ═══════════════════════════════════════════════════════════════
+# [OPS] ES Query Rogue Alert Hunter — Dashboard Setup
+# Elasticsearch / Kibana 9.2.2
+# Run each step in Kibana Dev Console in order
+# ═══════════════════════════════════════════════════════════════
+
+
+# ───────────────────────────────────────────────────────────────
+# STEP 1 — Create the Lens saved object for "Detections Over Time"
+# This must exist BEFORE creating the dashboard
+# ───────────────────────────────────────────────────────────────
+
+POST kbn:/api/saved_objects/lens/ops-rogue-detections-over-time
+{
+  "attributes": {
+    "title": "Rogue Detections Over Time",
+    "visualizationType": "lnsXY",
+    "state": {
+      "visualization": {
+        "legend": { "isVisible": true, "position": "bottom" },
+        "valueLabels": "hide",
+        "preferredSeriesType": "bar_stacked",
+        "layers": [{
+          "layerId": "layer1",
+          "accessors": ["count"],
+          "seriesType": "bar_stacked",
+          "xAccessor": "timestamp",
+          "splitAccessor": "severity",
+          "layerType": "data"
+        }]
+      },
+      "query": { "query": "", "language": "kuery" },
+      "filters": [],
+      "datasourceStates": {
+        "formBased": {
+          "layers": {
+            "layer1": {
+              "columns": {
+                "timestamp": {
+                  "label": "@timestamp",
+                  "dataType": "date",
+                  "operationType": "date_histogram",
+                  "sourceField": "@timestamp",
+                  "isBucketed": true,
+                  "scale": "interval",
+                  "params": { "interval": "auto", "includeEmptyRows": true, "dropPartials": false }
+                },
+                "severity": {
+                  "label": "Severity",
+                  "dataType": "string",
+                  "operationType": "terms",
+                  "sourceField": "detection.severity",
+                  "isBucketed": true,
+                  "scale": "ordinal",
+                  "params": {
+                    "size": 5,
+                    "orderBy": { "type": "alphabetical", "fallback": false },
+                    "orderDirection": "asc",
+                    "otherBucket": false,
+                    "missingBucket": false,
+                    "parentFormat": { "id": "terms" }
+                  }
+                },
+                "count": {
+                  "label": "Detections",
+                  "dataType": "number",
+                  "operationType": "count",
+                  "sourceField": "___records___",
+                  "isBucketed": false,
+                  "scale": "ratio",
+                  "params": { "emptyAsNull": true }
+                }
+              },
+              "columnOrder": ["timestamp", "severity", "count"],
+              "incompleteColumns": {}
+            }
+          }
+        }
+      },
+      "internalReferences": [],
+      "adHocDataViews": {}
+    }
+  },
+  "references": [{
+    "type": "index-pattern",
+    "id": "2afc653f-39f8-4d75-bdee-18f1b5ff958a",
+    "name": "indexpattern-datasource-layer-layer1"
+  }]
+}
+
+# Expected response: "type": "lens", "id": "ops-rogue-detections-over-time"
+# If you get 409 Conflict the object already exists — skip to Step 2
+
+
+# ───────────────────────────────────────────────────────────────
+# STEP 2 — Create the dashboard
+# References the Lens object from Step 1 for panel 1
+# Panels 2-6 and 8 use legacy agg-based viz (confirmed working on 9.2.2)
+# ───────────────────────────────────────────────────────────────
+
+POST kbn:/api/saved_objects/dashboard/ops-rogue-alert-hunter-dash
+{
+  "attributes": {
+    "title": "[OPS] ES Query Rogue Alert Hunter",
+    "description": "Behavioural detection for rogue .es-query Kibana rules. Powered by ops-rogue-alert-hunter Watcher (5m).",
+    "timeRestore": true,
+    "timeFrom": "now-24h",
+    "timeTo": "now",
+    "refreshInterval": { "pause": false, "value": 30000 },
+    "kibanaSavedObjectMeta": {
+      "searchSourceJSON": "{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
+    },
+    "optionsJSON": "{\"useMargins\":true,\"syncColors\":false,\"hidePanelTitles\":false}",
+    "panelsJSON": "[{\"version\":\"9.2.2\",\"type\":\"lens\",\"gridData\":{\"x\":0,\"y\":0,\"w\":24,\"h\":14,\"i\":\"1\"},\"panelIndex\":\"1\",\"embeddableConfig\":{\"title\":\"Rogue Detections Over Time\",\"description\":\"Warning (>1s) and Critical (>5s) detections written every 5 minutes by the Watcher\",\"enhancements\":{}},\"panelRefName\":\"panel_1\"},{\"version\":\"9.2.2\",\"type\":\"visualization\",\"gridData\":{\"x\":24,\"y\":0,\"w\":12,\"h\":7,\"i\":\"2\"},\"panelIndex\":\"2\",\"embeddableConfig\":{\"title\":\"Worst Single Execution (ms)\",\"savedVis\":{\"title\":\"Worst Single Execution (ms)\",\"type\":\"metric\",\"params\":{\"addTooltip\":true,\"addLegend\":false,\"type\":\"metric\",\"metric\":{\"percentageMode\":false,\"useRanges\":true,\"colorSchema\":\"Green to Red\",\"metricColorMode\":\"Background\",\"colorsRange\":[{\"from\":0,\"to\":1000,\"color\":\"#54B399\"},{\"from\":1000,\"to\":5000,\"color\":\"#F5A700\"},{\"from\":5000,\"to\":99999999,\"color\":\"#CC5642\"}],\"labels\":{\"show\":true},\"style\":{\"fontSize\":40}}},\"data\":{\"searchSource\":{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[],\"index\":\"2afc653f-39f8-4d75-bdee-18f1b5ff958a\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"max\",\"params\":{\"field\":\"detection.duration_ms\"},\"schema\":\"metric\"}]}},\"enhancements\":{}}},{\"version\":\"9.2.2\",\"type\":\"visualization\",\"gridData\":{\"x\":36,\"y\":0,\"w\":12,\"h\":7,\"i\":\"3\"},\"panelIndex\":\"3\",\"embeddableConfig\":{\"title\":\"Total Detections (24h)\",\"savedVis\":{\"title\":\"Total Detections (24h)\",\"type\":\"metric\",\"params\":{\"addTooltip\":true,\"addLegend\":false,\"type\":\"metric\",\"metric\":{\"percentageMode\":false,\"useRanges\":false,\"colorSchema\":\"Green to Red\",\"metricColorMode\":\"None\",\"colorsRange\":[{\"from\":0,\"to\":10000}],\"labels\":{\"show\":true},\"style\":{\"fontSize\":40}}},\"data\":{\"searchSource\":{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[],\"index\":\"2afc653f-39f8-4d75-bdee-18f1b5ff958a\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"}]}},\"enhancements\":{}}},{\"version\":\"9.2.2\",\"type\":\"visualization\",\"gridData\":{\"x\":24,\"y\":7,\"w\":12,\"h\":7,\"i\":\"4\"},\"panelIndex\":\"4\",\"embeddableConfig\":{\"title\":\"Critical Detections (>5s)\",\"savedVis\":{\"title\":\"Critical Detections (>5s)\",\"type\":\"metric\",\"params\":{\"addTooltip\":true,\"addLegend\":false,\"type\":\"metric\",\"metric\":{\"percentageMode\":false,\"useRanges\":true,\"colorSchema\":\"Green to Red\",\"metricColorMode\":\"Background\",\"colorsRange\":[{\"from\":0,\"to\":1,\"color\":\"#54B399\"},{\"from\":1,\"to\":99999,\"color\":\"#CC5642\"}],\"labels\":{\"show\":true},\"style\":{\"fontSize\":40}}},\"data\":{\"searchSource\":{\"query\":{\"query\":\"detection.severity: critical\",\"language\":\"kuery\"},\"filter\":[],\"index\":\"2afc653f-39f8-4d75-bdee-18f1b5ff958a\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"}]}},\"enhancements\":{}}},{\"version\":\"9.2.2\",\"type\":\"visualization\",\"gridData\":{\"x\":36,\"y\":7,\"w\":12,\"h\":7,\"i\":\"5\"},\"panelIndex\":\"5\",\"embeddableConfig\":{\"title\":\"Warning Detections (>1s)\",\"savedVis\":{\"title\":\"Warning Detections (>1s)\",\"type\":\"metric\",\"params\":{\"addTooltip\":true,\"addLegend\":false,\"type\":\"metric\",\"metric\":{\"percentageMode\":false,\"useRanges\":true,\"colorSchema\":\"Green to Red\",\"metricColorMode\":\"Background\",\"colorsRange\":[{\"from\":0,\"to\":1,\"color\":\"#54B399\"},{\"from\":1,\"to\":99999,\"color\":\"#F5A700\"}],\"labels\":{\"show\":true},\"style\":{\"fontSize\":40}}},\"data\":{\"searchSource\":{\"query\":{\"query\":\"detection.severity: warning\",\"language\":\"kuery\"},\"filter\":[],\"index\":\"2afc653f-39f8-4d75-bdee-18f1b5ff958a\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"}]}},\"enhancements\":{}}},{\"version\":\"9.2.2\",\"type\":\"visualization\",\"gridData\":{\"x\":0,\"y\":14,\"w\":48,\"h\":14,\"i\":\"6\"},\"panelIndex\":\"6\",\"embeddableConfig\":{\"title\":\"Current Offenders \u2014 Enriched Detection Table\",\"savedVis\":{\"title\":\"Current Offenders\",\"type\":\"table\",\"params\":{\"perPage\":10,\"showPartialRows\":false,\"showMetricsAtAllLevels\":false,\"sort\":{\"columnIndex\":1,\"direction\":\"desc\"},\"showTotal\":false},\"data\":{\"searchSource\":{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[],\"index\":\"2afc653f-39f8-4d75-bdee-18f1b5ff958a\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{\"customLabel\":\"Detections\"},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"max\",\"params\":{\"field\":\"detection.duration_ms\",\"customLabel\":\"Max duration (ms)\"},\"schema\":\"metric\"},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"rule.id\",\"orderBy\":\"2\",\"order\":\"desc\",\"size\":20,\"customLabel\":\"Rule ID\"},\"schema\":\"bucket\"},{\"id\":\"4\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"rule.name\",\"orderBy\":\"_key\",\"order\":\"asc\",\"size\":1,\"customLabel\":\"Rule name\"},\"schema\":\"bucket\"},{\"id\":\"5\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"rule.created_by\",\"orderBy\":\"_key\",\"order\":\"asc\",\"size\":1,\"customLabel\":\"Created by\"},\"schema\":\"bucket\"},{\"id\":\"6\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"detection.severity\",\"orderBy\":\"_key\",\"order\":\"desc\",\"size\":1,\"customLabel\":\"Severity\"},\"schema\":\"bucket\"},{\"id\":\"7\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"rule.schedule\",\"orderBy\":\"_key\",\"order\":\"asc\",\"size\":1,\"customLabel\":\"Schedule\"},\"schema\":\"bucket\"},{\"id\":\"8\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"rule.tags\",\"orderBy\":\"_key\",\"order\":\"asc\",\"size\":3,\"customLabel\":\"Tags\"},\"schema\":\"bucket\"}]}},\"enhancements\":{}}},{\"version\":\"9.2.2\",\"type\":\"visualization\",\"gridData\":{\"x\":0,\"y\":28,\"w\":48,\"h\":14,\"i\":\"8\"},\"panelIndex\":\"8\",\"embeddableConfig\":{\"title\":\"Rule Health Scorecard\",\"description\":\"Max duration per rule \u2014 sorted worst first\",\"savedVis\":{\"title\":\"Rule Health Scorecard\",\"type\":\"table\",\"params\":{\"perPage\":10,\"showPartialRows\":false,\"showMetricsAtAllLevels\":false,\"sort\":{\"columnIndex\":0,\"direction\":\"desc\"},\"showTotal\":false},\"data\":{\"searchSource\":{\"query\":{\"query\":\"event.provider: alerting AND event.action: execute\",\"language\":\"kuery\"},\"filter\":[],\"index\":\"9013e9ca-b938-4018-984d-75e644288f46\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"max\",\"params\":{\"field\":\"event.duration\",\"customLabel\":\"Max duration (ns)\"},\"schema\":\"metric\"},{\"id\":\"4\",\"enabled\":true,\"type\":\"count\",\"params\":{\"customLabel\":\"Executions\"},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"rule.name\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":20,\"customLabel\":\"Rule name\"},\"schema\":\"bucket\"},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"event.outcome\",\"orderBy\":\"_key\",\"order\":\"asc\",\"size\":5,\"customLabel\":\"Outcome\"},\"schema\":\"bucket\"}]}},\"enhancements\":{}}}]"
+  },
+  "references": [
+    { "type": "lens",          "id": "ops-rogue-detections-over-time",             "name": "panel_1" },
+    { "type": "index-pattern", "id": "2afc653f-39f8-4d75-bdee-18f1b5ff958a", "name": "panel-2-index-pattern" },
+    { "type": "index-pattern", "id": "2afc653f-39f8-4d75-bdee-18f1b5ff958a", "name": "panel-3-index-pattern" },
+    { "type": "index-pattern", "id": "2afc653f-39f8-4d75-bdee-18f1b5ff958a", "name": "panel-4-index-pattern" },
+    { "type": "index-pattern", "id": "2afc653f-39f8-4d75-bdee-18f1b5ff958a", "name": "panel-5-index-pattern" },
+    { "type": "index-pattern", "id": "2afc653f-39f8-4d75-bdee-18f1b5ff958a", "name": "panel-6-index-pattern" },
+    { "type": "index-pattern", "id": "9013e9ca-b938-4018-984d-75e644288f46", "name": "panel-8-index-pattern" }
+  ]
+}
+
+# Expected response: "type": "dashboard", "id": "ops-rogue-alert-hunter-dash"
+# Open at: https://<your-kibana>/app/dashboards#/view/ops-rogue-alert-hunter-dash
+
+
+# ───────────────────────────────────────────────────────────────
+# STEP 3 — Add Panel 1 via Kibana UI (required for Lens panels)
+#
+# The dashboard API cannot fully wire Lens panels in 9.2.2.
+# Panel 1 (Rogue Detections Over Time) must be added manually:
+#
+# 1. Open the dashboard: Dashboards → [OPS] ES Query Rogue Alert Hunter
+# 2. Click Edit
+# 3. Click Add panel → Add from library
+# 4. Search "Rogue Detections Over Time" → click to add
+# 5. Drag it to the top-left position (row 1)
+# 6. Delete the empty placeholder panel 1 if present
+# 7. Click Save
+# ───────────────────────────────────────────────────────────────
+
+
+# ───────────────────────────────────────────────────────────────
+# STEP 4 — Verify all panels are working
+# ───────────────────────────────────────────────────────────────
+
+GET kbn:/api/saved_objects/dashboard/ops-rogue-alert-hunter-dash
+
+# Expected: 7 panels in panelsJSON
+# Panel layout:
+#   Row 1: Detections Over Time (Lens) | Worst Execution | Total
+#                                      | Critical        | Warning
+#   Row 2: Current Offenders Table (full width)
+#   Row 3: Rule Health Scorecard (full width)
+
+
+# ───────────────────────────────────────────────────────────────
+# CLEANUP — Delete and recreate if needed
+# ───────────────────────────────────────────────────────────────
+
+# Delete dashboard
+# DELETE kbn:/api/saved_objects/dashboard/ops-rogue-alert-hunter-dash
+
+# Delete Lens object
+# DELETE kbn:/api/saved_objects/lens/ops-rogue-detections-over-time
+
+# Delete stale duration distribution Lens object if still present
+# DELETE kbn:/api/saved_objects/lens/ops-rogue-duration-distribution
