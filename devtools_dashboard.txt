@@ -1,0 +1,84 @@
+# ═══════════════════════════════════════════════════════════════════════
+# [OPS] ES Query Rogue Alert Hunter — Dashboard Dev Console Commands
+# Tested and confirmed working on ES/Kibana 9.4.1 — Elastic Cloud
+#
+# PREREQUISITES (create these Lens objects first):
+#   1. ops-rogue-detections-over-time  → devtools_correlation_panels.txt
+#   2. ops-tm-drift-over-time          → devtools_correlation_panels.txt
+#   3. ops-alert-vs-tm-overlay         → devtools_correlation_panels.txt
+#
+# DATA VIEW IDs hardcoded below — replace if yours differ:
+#   [OPS] Rogue Alert Detections: 8ccc09a9-8662-4dfb-89d8-58af2d3203e0
+#   [OPS] Kibana Event Log:       e1aea699-8522-4fb9-85e3-95ac7142fcdd
+#
+# AFTER RUNNING THIS PUT:
+#   Dashboard → Edit → Add panel → Add from library → add 3 Lens panels
+#   Then open each Lens metric panel → Save and return (clears time override)
+# ═══════════════════════════════════════════════════════════════════════
+
+PUT kbn:/api/saved_objects/dashboard/ops-rogue-alert-hunter-dash
+{
+  "attributes": {
+    "description": "Behavioural detection for rogue .es-query Kibana rules. Powered by OPS Rogue Alert Detector Workflow (5m).",
+    "title": "[OPS] ES Query Rogue Alert Hunter",
+    "optionsJSON": "{\"hidePanelTitles\": false, \"hidePanelBorders\": false, \"useMargins\": true, \"autoApplyFilters\": true, \"syncColors\": false, \"syncCursor\": true, \"syncTooltips\": false}",
+    "panelsJSON": "[{\"type\": \"vis\", \"embeddableConfig\": {\"title\": \"Rogue Detections Over Time\", \"description\": \"Warning (>1s) and Critical (>5s) detections written every 5 minutes by the Workflow\"}, \"panelIndex\": \"1\", \"gridData\": {\"y\": 0, \"x\": 0, \"w\": 24, \"h\": 14, \"i\": \"1\"}}, {\"type\": \"legacy_vis\", \"embeddableConfig\": {\"title\": \"Worst Single Execution (ms)\", \"savedVis\": {\"title\": \"Worst Single Execution (ms)\", \"description\": \"\", \"type\": \"metric\", \"params\": {\"addTooltip\": true, \"addLegend\": false, \"type\": \"metric\", \"metric\": {\"percentageMode\": false, \"useRanges\": true, \"colorSchema\": \"Green to Red\", \"metricColorMode\": \"Background\", \"colorsRange\": [{\"from\": 0, \"to\": 1000, \"color\": \"#54B399\"}, {\"from\": 1000, \"to\": 5000, \"color\": \"#F5A700\"}, {\"from\": 5000, \"to\": 99999999, \"color\": \"#CC5642\"}], \"labels\": {\"show\": true}, \"style\": {\"fontSize\": 40}}}, \"uiState\": {}, \"data\": {\"aggs\": [{\"id\": \"1\", \"enabled\": true, \"type\": \"max\", \"params\": {\"field\": \"detection.duration_ms\"}, \"schema\": \"metric\"}], \"searchSource\": {\"query\": {\"query\": \"\", \"language\": \"kuery\"}, \"filter\": [], \"indexRefName\": \"kibanaSavedObjectMeta.searchSourceJSON.index\"}}}}, \"panelIndex\": \"2\", \"gridData\": {\"y\": 0, \"x\": 24, \"w\": 12, \"h\": 7, \"i\": \"2\"}}, {\"type\": \"vis\", \"embeddableConfig\": {\"title\": \"Total Detections\", \"attributes\": {\"title\": \"Total Detections\", \"description\": \"\", \"visualizationType\": \"lnsMetric\", \"references\": [{\"type\": \"index-pattern\", \"id\": \"8ccc09a9-8662-4dfb-89d8-58af2d3203e0\", \"name\": \"indexpattern-datasource-layer-b67ac38f-616b-4b2f-994b-51681898cc51\"}], \"state\": {\"visualization\": {\"layerId\": \"b67ac38f-616b-4b2f-994b-51681898cc51\", \"layerType\": \"data\", \"metricAccessor\": \"7f29a872-d7da-4f03-84f7-e18c31d0ad12\"}, \"query\": {\"query\": \"\", \"language\": \"kuery\"}, \"filters\": [], \"datasourceStates\": {\"formBased\": {\"layers\": {\"b67ac38f-616b-4b2f-994b-51681898cc51\": {\"ignoreGlobalFilters\": false, \"columns\": {\"7f29a872-d7da-4f03-84f7-e18c31d0ad12\": {\"label\": \"Total Detections\", \"dataType\": \"number\", \"operationType\": \"count\", \"isBucketed\": false, \"sourceField\": \"___records___\", \"params\": {\"emptyAsNull\": true}, \"customLabel\": true}}, \"columnOrder\": [\"7f29a872-d7da-4f03-84f7-e18c31d0ad12\"], \"incompleteColumns\": {}}}}, \"indexpattern\": {\"layers\": {}}, \"textBased\": {\"layers\": {}}}, \"internalReferences\": [], \"adHocDataViews\": {}}, \"version\": 2}}, \"panelIndex\": \"3\", \"gridData\": {\"y\": 0, \"x\": 36, \"w\": 12, \"h\": 7, \"i\": \"3\"}}, {\"type\": \"vis\", \"embeddableConfig\": {\"title\": \"Critical Detections (>5s)\", \"attributes\": {\"title\": \"Critical Detections (>5s)\", \"description\": \"\", \"visualizationType\": \"lnsMetric\", \"references\": [{\"type\": \"index-pattern\", \"id\": \"8ccc09a9-8662-4dfb-89d8-58af2d3203e0\", \"name\": \"indexpattern-datasource-layer-c71c2257-1b18-4cda-9707-39a98c3bf4c5\"}], \"state\": {\"visualization\": {\"layerId\": \"c71c2257-1b18-4cda-9707-39a98c3bf4c5\", \"layerType\": \"data\", \"metricAccessor\": \"d5285ec5-21cc-4c2f-963d-30407711bd4e\", \"palette\": {\"name\": \"custom\", \"type\": \"palette\", \"params\": {\"steps\": 3, \"name\": \"custom\", \"reverse\": false, \"rangeType\": \"number\", \"rangeMin\": 0, \"rangeMax\": null, \"progression\": \"fixed\", \"stops\": [{\"color\": \"#1f926f\", \"stop\": 1}, {\"color\": \"#f01709\", \"stop\": 2}], \"colorStops\": [{\"color\": \"#1f926f\", \"stop\": 0}, {\"color\": \"#f01709\", \"stop\": 1}], \"continuity\": \"above\", \"maxSteps\": 5}}, \"icon\": \"alert\", \"iconAlign\": \"right\", \"showBar\": false, \"applyColorTo\": \"background\"}, \"query\": {\"query\": \"\", \"language\": \"kuery\"}, \"filters\": [], \"datasourceStates\": {\"formBased\": {\"layers\": {\"c71c2257-1b18-4cda-9707-39a98c3bf4c5\": {\"ignoreGlobalFilters\": false, \"columns\": {\"d5285ec5-21cc-4c2f-963d-30407711bd4e\": {\"label\": \"Critical\", \"dataType\": \"number\", \"operationType\": \"count\", \"isBucketed\": false, \"sourceField\": \"___records___\", \"params\": {\"emptyAsNull\": false, \"format\": {\"id\": \"number\", \"params\": {\"decimals\": 0}}}, \"customLabel\": true, \"filter\": {\"query\": \"detection.severity: critical\", \"language\": \"kuery\"}}}, \"columnOrder\": [\"d5285ec5-21cc-4c2f-963d-30407711bd4e\"], \"incompleteColumns\": {}}}}, \"indexpattern\": {\"layers\": {}}, \"textBased\": {\"layers\": {}}}, \"internalReferences\": [], \"adHocDataViews\": {}}, \"version\": 2}}, \"panelIndex\": \"4\", \"gridData\": {\"y\": 7, \"x\": 24, \"w\": 12, \"h\": 7, \"i\": \"4\"}}, {\"type\": \"vis\", \"embeddableConfig\": {\"title\": \"Warning Detections (>1s)\", \"attributes\": {\"title\": \"Warning Detections (>1s)\", \"description\": \"\", \"visualizationType\": \"lnsMetric\", \"references\": [{\"type\": \"index-pattern\", \"id\": \"8ccc09a9-8662-4dfb-89d8-58af2d3203e0\", \"name\": \"indexpattern-datasource-layer-9e4af41f-a29a-48e4-b8d9-8bc7c19a36ad\"}], \"state\": {\"visualization\": {\"layerId\": \"9e4af41f-a29a-48e4-b8d9-8bc7c19a36ad\", \"layerType\": \"data\", \"metricAccessor\": \"5cece880-28b5-4543-b1d6-2b90bc12e4a8\", \"palette\": {\"name\": \"custom\", \"params\": {\"maxSteps\": 5, \"name\": \"custom\", \"progression\": \"fixed\", \"rangeMax\": 99999, \"rangeMin\": 0, \"rangeType\": \"number\", \"reverse\": false, \"continuity\": \"none\", \"colorStops\": [{\"color\": \"#006837\", \"stop\": 0}, {\"color\": \"#EAAE01\", \"stop\": 1}], \"stops\": [{\"color\": \"#006837\", \"stop\": 1}, {\"color\": \"#EAAE01\", \"stop\": 52}], \"steps\": 5}, \"type\": \"palette\"}, \"applyColorTo\": \"background\"}, \"query\": {\"query\": \"detection.severity: warning\", \"language\": \"kuery\"}, \"filters\": [], \"datasourceStates\": {\"formBased\": {\"layers\": {\"9e4af41f-a29a-48e4-b8d9-8bc7c19a36ad\": {\"ignoreGlobalFilters\": false, \"columns\": {\"5cece880-28b5-4543-b1d6-2b90bc12e4a8\": {\"label\": \"Warning\", \"dataType\": \"number\", \"operationType\": \"count\", \"isBucketed\": false, \"sourceField\": \"___records___\", \"params\": {\"emptyAsNull\": true}, \"customLabel\": true}}, \"columnOrder\": [\"5cece880-28b5-4543-b1d6-2b90bc12e4a8\"], \"incompleteColumns\": {}, \"indexPatternId\": \"8ccc09a9-8662-4dfb-89d8-58af2d3203e0\"}}, \"currentIndexPatternId\": \"8ccc09a9-8662-4dfb-89d8-58af2d3203e0\"}, \"indexpattern\": {\"layers\": {}}, \"textBased\": {\"layers\": {}}}, \"internalReferences\": [], \"adHocDataViews\": {}}, \"version\": 2}}, \"panelIndex\": \"5\", \"gridData\": {\"y\": 7, \"x\": 36, \"w\": 12, \"h\": 7, \"i\": \"5\"}}, {\"type\": \"legacy_vis\", \"embeddableConfig\": {\"title\": \"Current Offenders \u2014 Enriched Detection Table\", \"savedVis\": {\"title\": \"Current Offenders\", \"description\": \"\", \"type\": \"table\", \"params\": {\"perPage\": 10, \"showPartialRows\": false, \"showMetricsAtAllLevels\": false, \"sort\": {\"columnIndex\": 1, \"direction\": \"desc\"}, \"showTotal\": false, \"showToolbar\": false, \"totalFunc\": \"sum\", \"percentageCol\": \"\", \"autoFitRowToContent\": false}, \"uiState\": {}, \"data\": {\"aggs\": [{\"id\": \"1\", \"enabled\": true, \"type\": \"count\", \"params\": {\"customLabel\": \"Detections\", \"emptyAsNull\": false}, \"schema\": \"metric\"}, {\"id\": \"2\", \"enabled\": true, \"type\": \"max\", \"params\": {\"field\": \"detection.duration_ms\", \"customLabel\": \"Max duration (ms)\"}, \"schema\": \"metric\"}, {\"id\": \"3\", \"enabled\": true, \"type\": \"terms\", \"params\": {\"field\": \"rule.id\", \"orderBy\": \"2\", \"order\": \"desc\", \"size\": 20, \"otherBucket\": false, \"otherBucketLabel\": \"Other\", \"missingBucket\": false, \"includeIsRegex\": true, \"excludeIsRegex\": true, \"customLabel\": \"Rule ID\"}, \"schema\": \"bucket\"}, {\"id\": \"4\", \"enabled\": true, \"type\": \"terms\", \"params\": {\"field\": \"rule.name\", \"orderBy\": \"_key\", \"order\": \"asc\", \"size\": 1, \"otherBucket\": false, \"otherBucketLabel\": \"Other\", \"missingBucket\": false, \"includeIsRegex\": true, \"excludeIsRegex\": true, \"customLabel\": \"Rule name\"}, \"schema\": \"bucket\"}, {\"id\": \"5\", \"enabled\": true, \"type\": \"terms\", \"params\": {\"field\": \"rule.created_by\", \"orderBy\": \"_key\", \"order\": \"asc\", \"size\": 1, \"otherBucket\": false, \"otherBucketLabel\": \"Other\", \"missingBucket\": false, \"includeIsRegex\": true, \"excludeIsRegex\": true, \"customLabel\": \"Created by\"}, \"schema\": \"bucket\"}, {\"id\": \"6\", \"enabled\": true, \"type\": \"terms\", \"params\": {\"field\": \"detection.severity\", \"orderBy\": \"_key\", \"order\": \"desc\", \"size\": 1, \"otherBucket\": false, \"otherBucketLabel\": \"Other\", \"missingBucket\": false, \"includeIsRegex\": true, \"excludeIsRegex\": true, \"customLabel\": \"Severity\"}, \"schema\": \"bucket\"}, {\"id\": \"7\", \"enabled\": true, \"type\": \"terms\", \"params\": {\"field\": \"rule.schedule\", \"orderBy\": \"_key\", \"order\": \"asc\", \"size\": 1, \"otherBucket\": false, \"otherBucketLabel\": \"Other\", \"missingBucket\": false, \"includeIsRegex\": true, \"excludeIsRegex\": true, \"customLabel\": \"Schedule\"}, \"schema\": \"bucket\"}, {\"id\": \"8\", \"enabled\": true, \"type\": \"terms\", \"params\": {\"field\": \"rule.tags\", \"orderBy\": \"_key\", \"order\": \"asc\", \"size\": 3, \"otherBucket\": false, \"otherBucketLabel\": \"Other\", \"missingBucket\": false, \"includeIsRegex\": true, \"excludeIsRegex\": true, \"customLabel\": \"Tags\"}, \"schema\": \"bucket\"}], \"searchSource\": {\"query\": {\"query\": \"\", \"language\": \"kuery\"}, \"filter\": [], \"indexRefName\": \"kibanaSavedObjectMeta.searchSourceJSON.index\"}}}}, \"panelIndex\": \"6\", \"gridData\": {\"y\": 14, \"x\": 0, \"w\": 48, \"h\": 8, \"i\": \"6\"}}, {\"type\": \"legacy_vis\", \"embeddableConfig\": {\"title\": \"Rule Health Scorecard\", \"description\": \"Max duration per rule \u2014 sorted worst first\", \"savedVis\": {\"title\": \"Rule Health Scorecard\", \"description\": \"\", \"type\": \"table\", \"params\": {\"perPage\": 10, \"showPartialRows\": false, \"showMetricsAtAllLevels\": false, \"sort\": {\"columnIndex\": 0, \"direction\": \"desc\"}, \"showTotal\": false, \"showToolbar\": false, \"totalFunc\": \"sum\", \"percentageCol\": \"\", \"autoFitRowToContent\": false}, \"uiState\": {}, \"data\": {\"aggs\": [{\"id\": \"1\", \"enabled\": true, \"type\": \"max\", \"params\": {\"field\": \"event.duration\", \"customLabel\": \"Max duration (ns)\"}, \"schema\": \"metric\"}, {\"id\": \"4\", \"enabled\": true, \"type\": \"count\", \"params\": {\"customLabel\": \"Executions\", \"emptyAsNull\": false}, \"schema\": \"metric\"}, {\"id\": \"2\", \"enabled\": true, \"type\": \"terms\", \"params\": {\"field\": \"rule.name\", \"orderBy\": \"1\", \"order\": \"desc\", \"size\": 20, \"otherBucket\": false, \"otherBucketLabel\": \"Other\", \"missingBucket\": false, \"includeIsRegex\": true, \"excludeIsRegex\": true, \"customLabel\": \"Rule name\"}, \"schema\": \"bucket\"}, {\"id\": \"3\", \"enabled\": true, \"type\": \"terms\", \"params\": {\"field\": \"event.outcome\", \"orderBy\": \"_key\", \"order\": \"asc\", \"size\": 5, \"otherBucket\": false, \"otherBucketLabel\": \"Other\", \"missingBucket\": false, \"includeIsRegex\": true, \"excludeIsRegex\": true, \"customLabel\": \"Outcome\"}, \"schema\": \"bucket\"}], \"searchSource\": {\"query\": {\"query\": \"\", \"language\": \"kuery\"}, \"filter\": [], \"indexRefName\": \"kibanaSavedObjectMeta.searchSourceJSON.index\"}}}}, \"panelIndex\": \"8\", \"gridData\": {\"y\": 22, \"x\": 0, \"w\": 48, \"h\": 14, \"i\": \"8\"}}, {\"type\": \"vis\", \"embeddableConfig\": {}, \"panelIndex\": \"4eae9f5d-82fd-48de-aef5-c7aff7ff6bec\", \"gridData\": {\"y\": 36, \"x\": 0, \"w\": 24, \"h\": 15, \"i\": \"4eae9f5d-82fd-48de-aef5-c7aff7ff6bec\"}}, {\"type\": \"vis\", \"embeddableConfig\": {}, \"panelIndex\": \"92d191f4-d5f8-4f33-a43b-4046a08a4324\", \"gridData\": {\"y\": 36, \"x\": 24, \"w\": 24, \"h\": 15, \"i\": \"92d191f4-d5f8-4f33-a43b-4046a08a4324\"}}]",
+    "refreshInterval": {
+      "pause": false,
+      "value": 30000
+    },
+    "timeFrom": "now-24h",
+    "timeTo": "now",
+    "timeRestore": true,
+    "kibanaSavedObjectMeta": {
+      "searchSourceJSON": "{\"query\": {\"query\": \"\", \"language\": \"kuery\"}}"
+    }
+  },
+  "references": [
+    {
+      "name": "1:savedObjectRef",
+      "type": "lens",
+      "id": "ops-rogue-detections-over-time"
+    },
+    {
+      "name": "2:kibanaSavedObjectMeta.searchSourceJSON.index",
+      "type": "index-pattern",
+      "id": "8ccc09a9-8662-4dfb-89d8-58af2d3203e0"
+    },
+    {
+      "type": "index-pattern",
+      "id": "8ccc09a9-8662-4dfb-89d8-58af2d3203e0",
+      "name": "3:indexpattern-datasource-layer-b67ac38f-616b-4b2f-994b-51681898cc51"
+    },
+    {
+      "type": "index-pattern",
+      "id": "8ccc09a9-8662-4dfb-89d8-58af2d3203e0",
+      "name": "4:indexpattern-datasource-layer-c71c2257-1b18-4cda-9707-39a98c3bf4c5"
+    },
+    {
+      "type": "index-pattern",
+      "id": "8ccc09a9-8662-4dfb-89d8-58af2d3203e0",
+      "name": "5:indexpattern-datasource-layer-9e4af41f-a29a-48e4-b8d9-8bc7c19a36ad"
+    },
+    {
+      "name": "6:kibanaSavedObjectMeta.searchSourceJSON.index",
+      "type": "index-pattern",
+      "id": "8ccc09a9-8662-4dfb-89d8-58af2d3203e0"
+    },
+    {
+      "name": "8:kibanaSavedObjectMeta.searchSourceJSON.index",
+      "type": "index-pattern",
+      "id": "e1aea699-8522-4fb9-85e3-95ac7142fcdd"
+    },
+    {
+      "name": "4eae9f5d-82fd-48de-aef5-c7aff7ff6bec:savedObjectRef",
+      "type": "lens",
+      "id": "ops-tm-drift-over-time"
+    },
+    {
+      "name": "92d191f4-d5f8-4f33-a43b-4046a08a4324:savedObjectRef",
+      "type": "lens",
+      "id": "ops-alert-vs-tm-overlay"
+    }
+  ]
+}

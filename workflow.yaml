@@ -1,0 +1,193 @@
+name: OPS - Rogue Alert Detector
+description: |
+  Detects rogue .es-query rules by execution duration,
+  enriches with rule metadata via Kibana API,
+  writes to rogue-alert-detections index,
+  auto-disables critical offenders and sends email notification.
+enabled: true
+tags:
+  - ops
+  - rogue-alert-detection
+  - watchboard
+
+triggers:
+  - type: scheduled
+    with:
+      every: "5m"
+
+steps:
+
+  # ── Step 1: Find slow .es-query rules in last 5 minutes ──
+  # Column order: [0]execution_count [1]last_execution [2]rule_id
+  #               [3]rule_name [4]max_duration_ms [5]severity
+  - name: find_slow_rules
+    type: elasticsearch.esql.query
+    with:
+      query: |
+        FROM .kibana-event-log*
+        | WHERE @timestamp >= NOW() - 5 minutes
+        | WHERE event.provider == "alerting"
+        | WHERE event.action == "execute"
+        | WHERE event.duration > 1000000000
+        | STATS
+            max_duration_ns = MAX(event.duration),
+            execution_count = COUNT(*),
+            last_execution = MAX(@timestamp)
+          BY rule_id = rule.id, rule_name = rule.name
+        | EVAL
+            max_duration_ms = max_duration_ns / 1000000,
+            severity = CASE(max_duration_ns >= 5000000000, "critical", "warning")
+        | DROP max_duration_ns
+        | WHERE max_duration_ms IS NOT NULL
+        | SORT max_duration_ms DESC
+
+  # ── Step 2: For each offender — enrich, write, and remediate ──
+  - name: process_detections
+    type: foreach
+    foreach: "{{ steps.find_slow_rules.output.values }}"
+    steps:
+
+      # 2a — Get rule metadata from Kibana alerting API
+      - name: get_rule
+        type: kibana.request
+        with:
+          method: GET
+          path: "/api/alerting/rule/{{ foreach.item[2] }}"
+
+      # 2b — Write enriched detection to index
+      - name: index_detection
+        type: elasticsearch.index
+        with:
+          index: rogue-alert-detections
+          document:
+            "@timestamp": "{{ foreach.item[1] }}"
+            rule.id: "{{ foreach.item[2] }}"
+            rule.name: "{{ foreach.item[3] }}"
+            rule.type: ".es-query"
+            rule.created_by: "{{ steps.get_rule.output.created_by }}"
+            rule.created_at: "{{ steps.get_rule.output.created_at }}"
+            rule.tags: "{{ steps.get_rule.output.tags }}"
+            rule.schedule: "{{ steps.get_rule.output.schedule.interval }}"
+            detection.duration_ms: "{{ foreach.item[4] }}"
+            detection.severity: "{{ foreach.item[5] }}"
+            detection.executions_in_window: "{{ foreach.item[0] }}"
+            detection.execution_time: "{{ foreach.item[1] }}"
+            detection.window_size_h: "{{ steps.get_rule.output.params.timeWindowSize }}"
+            detection.excludes_previous_runs: "{{ steps.get_rule.output.params.excludeHitsFromPreviousRun }}"
+            detection.result_size: "{{ steps.get_rule.output.params.size }}"
+            detection.threshold_ms: 1000
+            detection.source: "workflow"
+
+      # 2c — If CRITICAL: disable rule + create case + send email
+      - name: handle_critical
+        type: if
+        condition: "foreach.item[5] : critical"
+        steps:
+
+          # Disable the offending rule immediately
+          - name: disable_rule
+            type: kibana.request
+            with:
+              method: POST
+              path: "/api/alerting/rule/{{ foreach.item[2] }}/_disable"
+
+          # Create a Kibana case for ops review
+          - name: create_case
+            type: cases.createCase
+            with:
+              title: "Rogue Alert Auto-Disabled: {{ foreach.item[3] }}"
+              description: |
+                A rogue .es-query alerting rule has been automatically disabled
+                due to excessive execution time.
+
+                Rule ID:      {{ foreach.item[2] }}
+                Rule name:    {{ foreach.item[3] }}
+                Created by:   {{ steps.get_rule.output.created_by }}
+                Tags:         {{ steps.get_rule.output.tags }}
+                Schedule:     {{ steps.get_rule.output.schedule.interval }}
+                Time window:  {{ steps.get_rule.output.params.timeWindowSize }}{{ steps.get_rule.output.params.timeWindowUnit }}
+                Max execution: {{ foreach.item[4] }}ms
+                Severity:     CRITICAL (>5,000ms)
+                Detected at:  {{ foreach.item[1] }}
+
+                Required actions:
+                1. Investigate in Stack Management > Rules
+                2. Fix the query — add filters, reduce time window
+                3. Re-enable: POST /api/alerting/rule/{{ foreach.item[2] }}/_enable
+
+                Dashboard: https://<your-kibana>/app/dashboards#/view/ops-rogue-alert-hunter-dash
+              tags:
+                - rogue-alert
+                - auto-disabled
+                - ops-watchboard
+              severity: critical
+
+          # Send email notification
+          - name: send_email
+            type: kibana.request
+            with:
+              method: POST
+              path: "/api/actions/connector/<your-email-connector-id>/_execute"
+              body:
+                params:
+                  to:
+                    - "ops-team@yourcompany.com"
+                  subject: "CRITICAL: Rogue Alert Auto-Disabled — {{ foreach.item[3] }}"
+                  message: |
+                    A rogue .es-query alerting rule has been automatically disabled
+                    to protect cluster health.
+
+                    Rule ID:       {{ foreach.item[2] }}
+                    Rule name:     {{ foreach.item[3] }}
+                    Created by:    {{ steps.get_rule.output.created_by }}
+                    Tags:          {{ steps.get_rule.output.tags }}
+                    Max execution: {{ foreach.item[4] }}ms
+                    Severity:      CRITICAL (>5,000ms)
+                    Detected at:   {{ foreach.item[1] }}
+
+                    REQUIRED ACTIONS
+
+                    1. Review: Stack Management > Rules > {{ foreach.item[3] }}
+                    2. Fix the query (add filters, reduce time window)
+                    3. Re-enable when safe:
+                       POST /api/alerting/rule/{{ foreach.item[2] }}/_enable
+
+                    Dashboard:
+                    https://<your-kibana>/app/dashboards#/view/ops-rogue-alert-hunter-dash
+
+                    A Kibana case has been created for tracking.
+                    Do NOT re-enable without fixing the query first.
+
+                    Sent automatically by OPS Rogue Alert Auto-Watchboard.
+
+      # 2d — If WARNING: send email only, no disable
+      - name: handle_warning
+        type: if
+        condition: "foreach.item[5] : warning"
+        steps:
+          - name: send_warning_email
+            type: kibana.request
+            with:
+              method: POST
+              path: "/api/actions/connector/<your-email-connector-id>/_execute"
+              body:
+                params:
+                  to:
+                    - "ops-team@yourcompany.com"
+                  subject: "WARNING: Slow Alert Rule Detected — {{ foreach.item[3] }}"
+                  message: |
+                    A slow .es-query alerting rule has been detected.
+                    This rule has NOT been disabled — investigate if this persists.
+
+                    Rule ID:       {{ foreach.item[2] }}
+                    Rule name:     {{ foreach.item[3] }}
+                    Created by:    {{ steps.get_rule.output.created_by }}
+                    Tags:          {{ steps.get_rule.output.tags }}
+                    Max execution: {{ foreach.item[4] }}ms
+                    Severity:      WARNING (>1,000ms)
+                    Detected at:   {{ foreach.item[1] }}
+
+                    Dashboard:
+                    https://<your-kibana>/app/dashboards#/view/ops-rogue-alert-hunter-dash
+
+                    Sent automatically by OPS Rogue Alert Auto-Watchboard.

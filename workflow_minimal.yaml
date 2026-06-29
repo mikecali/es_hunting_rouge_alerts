@@ -1,0 +1,77 @@
+name: OPS - Rogue Alert Detector
+description: |
+  Detects rogue .es-query rules by execution duration,
+  enriches with rule metadata via Kibana API,
+  and writes to rogue-alert-detections index.
+enabled: true
+tags:
+  - ops
+  - rogue-alert-detection
+
+triggers:
+  - type: scheduled
+    with:
+      every: "5m"
+
+steps:
+
+  # ── Step 1: Find slow .es-query rules in last 5 minutes ──
+  # Column order: [0]execution_count [1]last_execution [2]rule_id
+  #               [3]rule_name [4]max_duration_ms [5]severity
+  - name: find_slow_rules
+    type: elasticsearch.esql.query
+    with:
+      query: |
+        FROM .kibana-event-log*
+        | WHERE @timestamp >= NOW() - 5 minutes
+        | WHERE event.provider == "alerting"
+        | WHERE event.action == "execute"
+        | WHERE event.duration > 1000000000
+        | STATS
+            max_duration_ns = MAX(event.duration),
+            execution_count = COUNT(*),
+            last_execution = MAX(@timestamp)
+          BY rule_id = rule.id, rule_name = rule.name
+        | EVAL
+            max_duration_ms = max_duration_ns / 1000000,
+            severity = CASE(max_duration_ns >= 5000000000, "critical", "warning")
+        | DROP max_duration_ns
+        | WHERE max_duration_ms IS NOT NULL
+        | SORT max_duration_ms DESC
+
+  # ── Step 2: For each offender — enrich + write ──
+  - name: process_detections
+    type: foreach
+    foreach: "{{ steps.find_slow_rules.output.values }}"
+    steps:
+
+      # 2a — Get rule metadata from Kibana alerting API
+      - name: get_rule
+        type: kibana.request
+        with:
+          method: GET
+          path: "/api/alerting/rule/{{ foreach.item[2] }}"
+
+      # 2b — Write enriched detection to index
+      - name: index_detection
+        type: elasticsearch.index
+        with:
+          index: rogue-alert-detections
+          document:
+            "@timestamp": "{{ foreach.item[1] }}"
+            rule.id: "{{ foreach.item[2] }}"
+            rule.name: "{{ foreach.item[3] }}"
+            rule.type: ".es-query"
+            rule.created_by: "{{ steps.get_rule.output.created_by }}"
+            rule.created_at: "{{ steps.get_rule.output.created_at }}"
+            rule.tags: "{{ steps.get_rule.output.tags }}"
+            rule.schedule: "{{ steps.get_rule.output.schedule.interval }}"
+            detection.duration_ms: "{{ foreach.item[4] }}"
+            detection.severity: "{{ foreach.item[5] }}"
+            detection.executions_in_window: "{{ foreach.item[0] }}"
+            detection.execution_time: "{{ foreach.item[1] }}"
+            detection.window_size_h: "{{ steps.get_rule.output.params.timeWindowSize }}"
+            detection.excludes_previous_runs: "{{ steps.get_rule.output.params.excludeHitsFromPreviousRun }}"
+            detection.result_size: "{{ steps.get_rule.output.params.size }}"
+            detection.threshold_ms: 1000
+            detection.source: "workflow"

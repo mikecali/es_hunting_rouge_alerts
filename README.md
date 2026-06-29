@@ -1,20 +1,26 @@
 # 🔍 ES Query Rogue Alert Hunter
 
-> Behavioural detection and monitoring for runaway Kibana `.es-query` alerting rules on Elasticsearch 9.x clusters.
+> Behavioural detection, automated remediation, and cluster impact monitoring for runaway Kibana `.es-query` alerting rules on Elasticsearch 9.x clusters.
 
 ---
 
 ## The Problem
 
-Kibana alerting rules are invisible to the cluster until they cause damage. A single poorly-configured `.es-query` rule — running `match_all` over 24 hours of data every minute with `track_total_hits: 2147483647` — can consume enough search thread pool capacity to degrade every other query on the cluster. By the time you notice CPU saturation, the rule has been running for days.
+Kibana alerting rules are invisible to the cluster until they cause damage. A single poorly-configured `.es-query` rule — running `match_all` over 24 hours of data every minute with no filters and `excludeHitsFromPreviousRun: false` — can consume enough search thread pool capacity to degrade every other query on the cluster. By the time you notice CPU saturation, the rule has been running for days.
 
-The challenge: you cannot detect a rogue alert by looking at its name or tags. What matters is **how long it takes to execute**.
+The challenge: you cannot detect a rogue alert by looking at its name or tags. A rule named `_VALIDATE_P37_TwoXX` tagged `_DIAG_TEMP` is just as dangerous as one tagged `monitoring, ops`. What matters is **how long it takes to execute**.
 
 ---
 
 ## How It Works
 
-This solution detects rogue alerts **purely by execution behaviour**, not by metadata. It monitors the Kibana event log every 5 minutes and flags any `.es-query` rule whose execution time crosses a threshold — regardless of who created it, what it's named, or what tags it carries.
+This solution detects rogue alerts **purely by execution behaviour**, not by metadata. It uses an **Elastic Workflow** (GA in 9.4) running every 5 minutes to:
+
+1. Detect any `.es-query` rule whose execution time exceeds 1 second
+2. Enrich the detection with full rule metadata via the Kibana alerting API
+3. Write a detection document to `rogue-alert-detections`
+4. Auto-disable **critical** offenders (>5s) and notify via email
+5. Email-notify for **warning** tier (>1s) without disabling
 
 ### Detection Signal
 
@@ -22,8 +28,10 @@ This solution detects rogue alerts **purely by execution behaviour**, not by met
 event.duration  >  1,000,000,000 ns  (1 second)
 AND event.provider  =  "alerting"
 AND event.action    =  "execute"
-AND kibana.saved_objects.type_id  =  ".es-query"
+AND rule.id         =  <any .es-query rule>
 ```
+
+Read from `.kibana-event-log*` using ES|QL — no nested query required, `rule.id` and `rule.name` are available as top-level fields in 9.x.
 
 ### Detection Flow
 
@@ -37,7 +45,6 @@ AND kibana.saved_objects.type_id  =  ".es-query"
 │  └─────────────────────┘                    └──────────┬───────────┘   │
 │                                                        │               │
 │                                              writes execution record    │
-│                                                        │               │
 │                                                        ▼               │
 │                                           ┌────────────────────────┐   │
 │                                           │  .kibana-event-log*    │   │
@@ -47,67 +54,62 @@ AND kibana.saved_objects.type_id  =  ".es-query"
 │                                           │  event.action:         │   │
 │                                           │    "execute"           │   │
 │                                           │  event.duration:       │   │
-│                                           │    1,336,000,000 ns ◄──┼── rogue
-│                                           │  kibana.saved_objects  │   │
-│                                           │    .type_id:           │   │
-│                                           │    ".es-query"         │   │
+│                                           │    1,101,000,000 ns    │   │
+│                                           │  rule.id: <uuid>       │   │
+│                                           │  rule.name: <name>     │   │
 │                                           └────────────┬───────────┘   │
-│                                                        │               │
 └────────────────────────────────────────────────────────┼───────────────┘
                                                          │
-                              ┌──────────────────────────▼──────────────┐
-                              │      Watcher: ops-rogue-alert-hunter     │
-                              │      Schedule: every 5 minutes           │
-                              │                                          │
-                              │  Step 1 — Query event log               │
-                              │    event.duration > 1,000,000,000        │
-                              │    AND type_id = ".es-query"             │
-                              │    AND action  = "execute"               │
-                              │    Window: last 5 minutes                │
-                              │                                          │
-                              │  Step 2 — Group by rule ID               │
-                              │    max_duration per rule                 │
-                              │    execution_count per rule              │
-                              │                                          │
-                              │  Step 3 — Enrich                        │
-                              │    Lookup .kibana_alerting_cases_9*      │
-                              │    → rule.name, rule.created_by          │
-                              │    → rule.tags, rule.schedule            │
-                              │    → detection.window_size_h             │
-                              │    → detection.excludes_previous_runs    │
-                              │                                          │
-                              │  Step 4 — Classify severity              │
-                              │    ≥ 5,000 ms  →  CRITICAL               │
-                              │    ≥ 1,000 ms  →  WARNING                │
-                              │                                          │
-                              │  Step 5 — Write detection                │
-                              │    → rogue-alert-detections index        │
-                              └──────────────────────────┬──────────────┘
+                         ┌───────────────────────────────▼───────────────┐
+                         │   Elastic Workflow: OPS - Rogue Alert Detector │
+                         │   Schedule: every 5 minutes (GA in 9.4)        │
+                         │                                                │
+                         │  Step 1 — ES|QL query on .kibana-event-log*   │
+                         │    event.duration > 1,000,000,000 ns           │
+                         │    STATS max_duration, execution_count         │
+                         │    BY rule.id, rule.name                       │
+                         │    EVAL severity = CASE(>5s, critical,         │
+                         │                         warning)               │
+                         │                                                │
+                         │  Step 2 — foreach offending rule:             │
+                         │    GET /api/alerting/rule/{id}                │
+                         │    → rule.created_by, rule.tags               │
+                         │    → rule.schedule, params.timeWindowSize      │
+                         │    → params.excludeHitsFromPreviousRun        │
+                         │                                                │
+                         │  Step 3 — Write enriched detection            │
+                         │    → rogue-alert-detections index             │
+                         │                                                │
+                         │  Step 4 — if CRITICAL (>5s):                 │
+                         │    POST /api/alerting/rule/{id}/_disable      │
+                         │    cases.createCase                           │
+                         │    kibana.request → email connector           │
+                         │                                                │
+                         │  Step 5 — if WARNING (>1s):                  │
+                         │    kibana.request → email connector           │
+                         └───────────────────────────────┬───────────────┘
                                                          │
-                              ┌──────────────────────────▼──────────────┐
-                              │   rogue-alert-detections index           │
-                              │                                          │
-                              │  {                                       │
-                              │    "rule.name": "Elasticsearch query..", │
-                              │    "rule.created_by": "2763457433",      │
-                              │    "rule.tags": ["rouge"],               │
-                              │    "detection.duration_ms": 1336,        │
-                              │    "detection.severity": "warning",      │
-                              │    "detection.executions_in_window": 4   │
-                              │  }                                       │
-                              └──────────────────────────┬──────────────┘
+                         ┌───────────────────────────────▼───────────────┐
+                         │   rogue-alert-detections index                 │
+                         │                                                │
+                         │  {                                             │
+                         │    "rule.name": "rogue alert metrics 24h",    │
+                         │    "rule.created_by": "2763457433",           │
+                         │    "rule.tags": "rogue",                      │
+                         │    "rule.schedule": "1m",                     │
+                         │    "detection.duration_ms": 1101,             │
+                         │    "detection.severity": "warning",           │
+                         │    "detection.window_size_h": 24,             │
+                         │    "detection.excludes_previous_runs": false, │
+                         │    "detection.source": "workflow"             │
+                         │  }                                             │
+                         └───────────────────────────────┬───────────────┘
                                                          │
-                              ┌──────────────────────────▼──────────────┐
-                              │   [OPS] ES Query Rogue Alert Hunter      │
-                              │   Kibana Dashboard — auto-refresh 30s    │
-                              │                                          │
-                              │  • Detections over time (Lens bar chart) │
-                              │  • Worst single execution (ms metric)    │
-                              │  • Total / Critical / Warning counts     │
-                              │  • Current offenders table               │
-                              │    (name, creator, tags, severity)       │
-                              │  • Rule health scorecard                 │
-                              └─────────────────────────────────────────┘
+                         ┌───────────────────────────────▼───────────────┐
+                         │   [OPS] ES Query Rogue Alert Hunter            │
+                         │   Kibana Dashboard — auto-refresh 30s          │
+                         │   Time range: inherits from dashboard picker   │
+                         └───────────────────────────────────────────────┘
 ```
 
 ### Why Behavioural Detection?
@@ -119,51 +121,7 @@ AND kibana.saved_objects.type_id  =  ".es-query"
 | Creator-based allowlist | ❌ | ❌ | ❌ | ❌ |
 | **Duration-based (this solution)** | ✅ | ✅ | ✅ | ✅ |
 
-The `_TEST_Legit_Looking_Rule` test case validated this — a rule with tags `monitoring, ops`, created by a known account, with a reasonable-sounding name was still detected because its execution time crossed 1 second. Duration is an honest signal: if it's slow, it's consuming resources regardless of intent.
-
----
-
-## Dashboard
-
-The `[OPS] ES Query Rogue Alert Hunter` dashboard has 7 panels across 3 rows, auto-refreshing every 30 seconds with a default 24-hour time window.
-
-**Row 1 — Summary metrics**
-
-| Panel | Type | Data source | What it shows |
-|---|---|---|---|
-| Rogue Detections Over Time | Lens bar chart (stacked) | `rogue-alert-detections` | Warning vs critical detections over time at 30-minute intervals |
-| Worst Single Execution (ms) | Metric (colour-coded) | `rogue-alert-detections` | Max `detection.duration_ms` — green <1s, amber 1–5s, red >5s |
-| Total Detections (24h) | Metric | `rogue-alert-detections` | Count of all detection documents in the time window |
-| Critical Detections (>5s) | Metric (colour-coded) | `rogue-alert-detections` | Count where `detection.severity = critical` — green if 0, red if any |
-| Warning Detections (>1s) | Metric (colour-coded) | `rogue-alert-detections` | Count where `detection.severity = warning` — green if 0, amber if any |
-
-**Row 2 — Offenders table**
-
-| Panel | Type | Data source | What it shows |
-|---|---|---|---|
-| Current Offenders — Enriched Detection Table | Table | `rogue-alert-detections` | One row per offending rule: Rule ID, name, creator, severity, schedule, tags, detection count, max duration. Sorted by max duration descending. |
-
-**Row 3 — Cluster-level signals**
-
-| Panel | Type | Data source | What it shows |
-|---|---|---|---|
-| Rule Health Scorecard | Table | `.kibana-event-log*` | All `.es-query` rules ranked by max execution duration, with execution count and outcome. |
-
-> **Note on chart panels:** Panel 1 (Detections Over Time) uses Kibana **Lens** (`lnsXY`) and is created as a saved Lens object then added to the dashboard via the Visualize Library. The legacy `histogram` visualization type does not render in Kibana 9.x.
-
-**Live dashboard state (tested on ES/Kibana 9.2.2):**
-
-```
-Total detections: 49     Warning: 49     Critical: 0
-Worst execution:  1,336ms (amber — warning tier)
-
-Offenders table:
-  Elasticsearch query rule      rouge          18 detections   1,336ms
-  _TEST_ROGUE_Critical_Tier     _TEST          11 detections   1,285ms
-  Elasticsearch query rule      rouge_alert    11 detections   1,281ms
-  _TEST_Legit_Looking_Rule      monitoring,ops  7 detections   1,102ms
-  Rogue Alerts - 7days Metrics  rogue           1 detection    1,078ms
-```
+Validated: a rule tagged `monitoring, ops` with a clean name and known creator was still detected because its execution exceeded 1 second.
 
 ---
 
@@ -173,26 +131,26 @@ Offenders table:
 ┌──────────────────────────────────────────────────────────────┐
 │  INPUTS (read-only)                                          │
 │                                                              │
-│  .kibana-event-log*          — rule execution history        │
-│  .kibana_alerting_cases_9*   — rule metadata (name, tags)    │
+│  .kibana-event-log*     — rule execution history (ES|QL)    │
+│  Kibana Alerting API    — rule metadata per offender        │
 └──────────────────────────┬───────────────────────────────────┘
                            │  read only
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  DETECTION ENGINE                                            │
+│  DETECTION & REMEDIATION ENGINE                              │
 │                                                              │
-│  Elasticsearch Watcher                                       │
-│  ID: ops-rogue-alert-hunter                                  │
+│  Elastic Workflow: OPS - Rogue Alert Detector                │
+│  ID: ops-rogue-alert-detector                                │
 │  Schedule: every 5 minutes                                   │
-│  Impact: ~30–120ms per run                                   │
+│  Requires: Kibana 9.4+ (Workflows GA)                        │
 └──────────────────────────┬───────────────────────────────────┘
-                           │  writes
+                           │  writes detections
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  OUTPUT                                                      │
 │                                                              │
 │  rogue-alert-detections index                                │
-│  1 document per offending rule per Watcher run               │
+│  1 document per offending rule per Workflow run              │
 └──────────────────────────┬───────────────────────────────────┘
                            │  reads
                            ▼
@@ -217,11 +175,70 @@ Rule execution duration (ms)
 │       NORMAL             │       WARNING         │   CRITICAL
 │   (not detected)         │   (>1s threshold)     │  (>5s threshold)
 │                          │                       │
-│  All legitimate rules    │  Broad query, large   │  match_all over days,
-│  on your cluster run     │  time window, or      │  no filter, full
-│  under 1 second.         │  no filter applied.   │  shard scan.
-│  Fleet Agent rules:      │  Investigate.         │  Immediate action.
-│  60–130ms typical.       │                       │
+│  Legitimate rules run    │  Broad query, large   │  match_all over days,
+│  under 1 second.         │  time window, no      │  no filter, full
+│  Fleet Agent rules:      │  filter applied.      │  shard scan.
+│  60–130ms typical.       │  Email notification.  │  Auto-disabled +
+│                          │  No auto-disable.     │  case + email.
+```
+
+---
+
+## Dashboard
+
+The `[OPS] ES Query Rogue Alert Hunter` dashboard has 9 panels across 4 rows, auto-refreshing every 30 seconds. All panels inherit the dashboard time range — no fixed overrides.
+
+**Row 1 — Summary metrics**
+
+| Panel | Type | Data source | What it shows |
+|---|---|---|---|
+| Rogue Detections Over Time | Lens bar chart (stacked) | `rogue-alert-detections` | Warning vs critical detections over time |
+| Worst Single Execution (ms) | Legacy metric | `rogue-alert-detections` | Max `detection.duration_ms` — green <1s, amber 1–5s, red >5s |
+| Total Detections | Lens metric | `rogue-alert-detections` | Count of all detection documents in the time window |
+| Critical Detections (>5s) | Lens metric | `rogue-alert-detections` | Count where `detection.severity = critical` |
+| Warning Detections (>1s) | Lens metric | `rogue-alert-detections` | Count where `detection.severity = warning` |
+
+**Row 2 — Offenders table**
+
+| Panel | Type | Data source | What it shows |
+|---|---|---|---|
+| Current Offenders — Enriched Detection Table | Legacy table | `rogue-alert-detections` | Rule ID, name, creator, severity, schedule, tags, detection count, max duration — sorted by max duration |
+
+**Row 3 — Cluster-level signals**
+
+| Panel | Type | Data source | What it shows |
+|---|---|---|---|
+| Rule Health Scorecard | Legacy table | `.kibana-event-log*` | All `.es-query` rules ranked by max execution duration with execution count and outcome |
+
+**Row 4 — Cluster impact correlation**
+
+| Panel | Type | Data source | What it shows |
+|---|---|---|---|
+| Task Manager Drift Over Time | Lens line chart | `.kibana-event-log*` | p95 and max Task Manager task-run duration at 5-minute intervals. Healthy baseline: p95 < 500ms |
+| Alert Execution vs Task Manager Pressure | Lens line chart (2 series) | `.kibana-event-log*` | Max alerting execution duration overlaid against Task Manager p95 — shows the causal chain |
+
+---
+
+## Cluster Impact Correlation
+
+On Elastic Cloud Hosted, monitoring data is stored in a separate deployment. The Row 4 panels use `.kibana-event-log*` as a proxy for cluster impact.
+
+### Task Manager drift interpretation
+
+| p95 range | Status | Meaning |
+|---|---|---|
+| < 500ms | ✅ Healthy | Task Manager running on schedule |
+| 500ms – 1,000ms | ⚠️ Mild pressure | Monitor — possible low-impact rogue rule |
+| 1,000ms – 2,000ms | 🔴 Saturated | Expensive alert tasks consuming worker threads |
+| > 2,000ms | 🔴 Severe | Queue backing up, other tasks significantly delayed |
+
+**Evidence from cluster (confirmed):**
+```
+Task Manager p95 sustained: 1,000–1,800ms  (healthy baseline: <500ms)
+Task Manager max ceiling:   ~2,200ms
+Schedule delay observed:    1,455ms  (tasks waiting 1.45s before starting)
+Rule Success Ratio:         97.60%   (Stack Monitoring)
+Queued Rules:               7
 ```
 
 ---
@@ -231,7 +248,6 @@ Rule execution duration (ms)
 ### Detected ✅
 - `.es-query` rules with `match_all` and large time windows
 - Rules with `excludeHitsFromPreviousRun: false` causing full re-scans
-- Rules with `track_total_hits: 2147483647` (Kibana default for `.es-query`)
 - Rules scanning broad index patterns (`logs-*`, `metrics-*`) without filters
 - Rules on tight schedules (1m) with wide windows (24h+)
 - Any rule from any account — creator is irrelevant to detection
@@ -241,9 +257,8 @@ Rule execution duration (ms)
 - Rules that run fast but generate excessive actions (action flood)
 - Other rule types (`.index-threshold`, `slo.rules.burnRate`, ML rules)
 - Rules that are slow due to cluster degradation rather than query design
-- Indexing pressure or mapping issues
 
-> To extend detection to other rule types, change `kibana.saved_objects.type_id: ".es-query"` in the Watcher input query to `"*"` or add additional type IDs.
+> To extend detection to other rule types, add additional `WHERE rule.type` filters or remove the type constraint entirely from the ES|QL query.
 
 ---
 
@@ -253,21 +268,12 @@ Rule execution duration (ms)
 
 | Requirement | Detail |
 |---|---|
-| Elasticsearch | 9.x (tested on 9.2.2) |
-| Kibana | 9.x |
-| Watcher | Requires Platinum or Enterprise licence |
-| User role | `superuser` or `cluster:monitor`, `indices:admin/read` on `.kibana*` |
+| Elasticsearch | 9.4+ |
+| Kibana | 9.4+ (Elastic Workflows GA) |
+| Email connector | Configured in Stack Management → Connectors |
+| User role | Can create/manage Workflows, read `.kibana-event-log*`, write to `rogue-alert-detections` |
 
-### Step 1 — Check cluster shard headroom
-
-Before creating anything, verify you have at least 2 free shards:
-
-```
-GET _cluster/stats?filter_path=indices.shards.total
-```
-
-
-### Step 2 — Create the detections index
+### Step 1 — Create the detections index
 
 ```json
 PUT rogue-alert-detections
@@ -287,250 +293,20 @@ PUT rogue-alert-detections
       "rule.created_at":                    { "type": "date" },
       "rule.schedule":                      { "type": "keyword" },
       "detection.duration_ms":              { "type": "long" },
-      "detection.duration_s":               { "type": "float" },
       "detection.severity":                 { "type": "keyword" },
       "detection.threshold_ms":             { "type": "long" },
       "detection.execution_time":           { "type": "date" },
       "detection.executions_in_window":     { "type": "integer" },
       "detection.window_size_h":            { "type": "integer" },
       "detection.excludes_previous_runs":   { "type": "boolean" },
-      "detection.result_size":              { "type": "integer" }
+      "detection.result_size":              { "type": "integer" },
+      "detection.source":                   { "type": "keyword" }
     }
   }
 }
 ```
 
-Verify:
-```
-GET rogue-alert-detections/_mapping
-```
-
-### Step 3 — Deploy the Watcher
-
-> **Important:** The Watcher reads `.kibana-event-log*` (system index). In ES 9.x this generates a deprecation warning in logs. This is safe and expected. In a future major version, use the Kibana Event Log API instead.
-
-```json
-PUT _watcher/watch/ops-rogue-alert-hunter
-{
-  "trigger": {
-    "schedule": { "interval": "5m" }
-  },
-  "input": {
-    "chain": {
-      "inputs": [
-        {
-          "executions": {
-            "search": {
-              "request": {
-                "indices": [".kibana-event-log*"],
-                "body": {
-                  "size": 0,
-                  "query": {
-                    "bool": {
-                      "filter": [
-                        { "term": { "event.provider": "alerting" } },
-                        { "term": { "event.action": "execute" } },
-                        { "range": { "@timestamp": { "gte": "now-5m" } } },
-                        { "range": { "event.duration": { "gt": 1000000000 } } }
-                      ],
-                      "must": [
-                        {
-                          "nested": {
-                            "path": "kibana.saved_objects",
-                            "query": {
-                              "term": { "kibana.saved_objects.type_id": ".es-query" }
-                            }
-                          }
-                        }
-                      ]
-                    }
-                  },
-                  "aggs": {
-                    "by_rule": {
-                      "nested": { "path": "kibana.saved_objects" },
-                      "aggs": {
-                        "rule_id": {
-                          "terms": { "field": "kibana.saved_objects.id", "size": 50 },
-                          "aggs": {
-                            "back_to_root": {
-                              "reverse_nested": {},
-                              "aggs": {
-                                "max_duration": { "max": { "field": "event.duration" } },
-                                "execution_count": { "value_count": { "field": "event.duration" } },
-                                "last_execution": { "max": { "field": "@timestamp" } }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        },
-        {
-          "rule_metadata": {
-            "search": {
-              "request": {
-                "indices": [".kibana_alerting_cases_9*"],
-                "body": {
-                  "size": 100,
-                  "query": {
-                    "bool": {
-                      "must": [
-                        { "term": { "type": "alert" } },
-                        { "term": { "alert.alertTypeId": ".es-query" } }
-                      ]
-                    }
-                  },
-                  "_source": [
-                    "alert.name", "alert.tags", "alert.createdBy",
-                    "alert.createdAt", "alert.schedule",
-                    "alert.params.timeWindowSize", "alert.params.timeWindowUnit",
-                    "alert.params.size", "alert.params.excludeHitsFromPreviousRun"
-                  ]
-                }
-              }
-            }
-          }
-        }
-      ]
-    }
-  },
-  "condition": {
-    "script": {
-      "source": "return ctx.payload.executions.aggregations.by_rule.rule_id.buckets.size() > 0"
-    }
-  },
-  "transform": {
-    "script": {
-      "source": """
-        def docs = [];
-        def metaHits = ctx.payload.rule_metadata.hits.hits;
-        for (def bucket : ctx.payload.executions.aggregations.by_rule.rule_id.buckets) {
-          def ruleId = bucket.key;
-          def maxDurationNs = bucket.back_to_root.max_duration.value;
-          def maxDurationMs = (long)(maxDurationNs / 1000000);
-          def maxDurationS  = maxDurationNs / 1000000000.0;
-          def execCount     = bucket.back_to_root.execution_count.value;
-          def lastExec      = bucket.back_to_root.last_execution.value_as_string;
-          def severity      = maxDurationMs >= 5000 ? 'critical' : 'warning';
-          def ruleName    = ruleId;
-          def createdBy   = 'unknown';
-          def createdAt   = null;
-          def tags        = [];
-          def schedule    = '1m';
-          def windowSize  = 0;
-          def windowUnit  = 'h';
-          def resultSize  = 0;
-          def excludePrev = false;
-          for (def hit : metaHits) {
-            def hitId = hit._id.replace('alert:', '');
-            if (hitId == ruleId) {
-              def a = hit._source.alert;
-              ruleName    = a.name;
-              createdBy   = a.containsKey('createdBy')  ? a.createdBy  : 'unknown';
-              createdAt   = a.containsKey('createdAt')  ? a.createdAt  : null;
-              tags        = a.containsKey('tags')        ? a.tags       : [];
-              schedule    = a.containsKey('schedule')    ? a.schedule.interval : '1m';
-              if (a.containsKey('params')) {
-                windowSize  = a.params.containsKey('timeWindowSize') ? a.params.timeWindowSize : 0;
-                windowUnit  = a.params.containsKey('timeWindowUnit') ? a.params.timeWindowUnit : 'h';
-                resultSize  = a.params.containsKey('size')           ? a.params.size           : 0;
-                excludePrev = a.params.containsKey('excludeHitsFromPreviousRun') ? a.params.excludeHitsFromPreviousRun : false;
-              }
-              break;
-            }
-          }
-          def doc = [
-            '@timestamp':                       ctx.execution_time,
-            'rule.id':                          ruleId,
-            'rule.name':                        ruleName,
-            'rule.type':                        '.es-query',
-            'rule.tags':                        tags,
-            'rule.created_by':                  createdBy,
-            'rule.schedule':                    schedule,
-            'detection.duration_ms':            maxDurationMs,
-            'detection.duration_s':             maxDurationS,
-            'detection.severity':               severity,
-            'detection.threshold_ms':           severity == 'critical' ? 5000 : 1000,
-            'detection.execution_time':         lastExec,
-            'detection.executions_in_window':   execCount,
-            'detection.window_size_h':          windowSize,
-            'detection.excludes_previous_runs': excludePrev,
-            'detection.result_size':            resultSize
-          ];
-          if (createdAt != null) { doc['rule.created_at'] = createdAt; }
-          docs.add(doc);
-        }
-        return [ '_doc': docs ];
-      """
-    }
-  },
-  "actions": {
-    "index_detections": {
-      "foreach": "ctx.payload._doc",
-      "index": {
-        "index": "rogue-alert-detections"
-      }
-    },
-    "log_detections": {
-      "logging": {
-        "text": "[OPS] Rogue alert detected: {{ctx.payload._doc}}"
-      }
-    }
-  }
-}
-```
-
-### Step 4 — Smoke test the Watcher
-
-Trigger it manually and confirm it executes without errors:
-
-```json
-POST _watcher/watch/ops-rogue-alert-hunter/_execute
-{
-  "ignore_condition": false,
-  "action_modes": {
-    "index_detections": "execute",
-    "log_detections": "execute"
-  }
-}
-```
-
-Confirm detections landed:
-
-```json
-GET rogue-alert-detections/_search
-{
-  "sort": [{ "@timestamp": { "order": "desc" } }],
-  "size": 5
-}
-```
-
-If no results, your cluster has no `.es-query` rules exceeding 1 second — that is a healthy result. Verify by checking the event log directly:
-
-```json
-GET .kibana-event-log*/_search
-{
-  "size": 1,
-  "query": {
-    "bool": {
-      "filter": [
-        { "term": { "event.provider": "alerting" } },
-        { "term": { "event.action": "execute" } },
-        { "range": { "event.duration": { "gt": 1000000000 } } }
-      ]
-    }
-  }
-}
-```
-
-### Step 5 — Create Kibana data views
-
-Run in Kibana Dev Console:
+### Step 2 — Create Kibana data views
 
 ```json
 POST kbn:/api/data_views/data_view
@@ -554,195 +330,299 @@ POST kbn:/api/data_views/data_view
 }
 ```
 
-Copy both `id` values from the responses — you need them for Step 6.
+Note the `id` from both responses — needed for Step 4.
 
-### Step 6 — Deploy the dashboard
+### Step 3 — Deploy the Workflow
 
-Use `dashboard_payload.json` from this repository. Replace the two placeholder data view IDs with your IDs from Step 5, then run:
+Go to **Stack Management → Workflows → Create workflow** and paste the contents of `workflow.yaml`.
 
+Before saving replace:
+- `<your-email-connector-id>` — get from Stack Management → Connectors (appears twice)
+- `ops-team@yourcompany.com` — your ops distribution list (appears twice)
+- `https://<your-kibana>` — your Kibana URL (appears in case description and emails)
+
+**Workflow — tested and validated (`workflow_minimal.yaml`):**
+
+> ✅ This is the version confirmed working on ES/Kibana 9.4.1.
+
+```yaml
+name: OPS - Rogue Alert Detector
+description: |
+  Detects rogue .es-query rules by execution duration,
+  enriches with rule metadata via Kibana API,
+  and writes to rogue-alert-detections index.
+enabled: true
+tags:
+  - ops
+  - rogue-alert-detection
+
+triggers:
+  - type: scheduled
+    with:
+      every: "5m"
+
+steps:
+
+  # ── Step 1: Find slow .es-query rules in last 5 minutes ──
+  # Column order: [0]execution_count [1]last_execution [2]rule_id
+  #               [3]rule_name [4]max_duration_ms [5]severity
+  - name: find_slow_rules
+    type: elasticsearch.esql.query
+    with:
+      query: |
+        FROM .kibana-event-log*
+        | WHERE @timestamp >= NOW() - 5 minutes
+        | WHERE event.provider == "alerting"
+        | WHERE event.action == "execute"
+        | WHERE event.duration > 1000000000
+        | STATS
+            max_duration_ns = MAX(event.duration),
+            execution_count = COUNT(*),
+            last_execution = MAX(@timestamp)
+          BY rule_id = rule.id, rule_name = rule.name
+        | EVAL
+            max_duration_ms = max_duration_ns / 1000000,
+            severity = CASE(max_duration_ns >= 5000000000, "critical", "warning")
+        | DROP max_duration_ns
+        | WHERE max_duration_ms IS NOT NULL
+        | SORT max_duration_ms DESC
+
+  # ── Step 2: For each offender — enrich + write ──
+  - name: process_detections
+    type: foreach
+    foreach: "{{ steps.find_slow_rules.output.values }}"
+    steps:
+
+      # 2a — Get rule metadata from Kibana alerting API
+      - name: get_rule
+        type: kibana.request
+        with:
+          method: GET
+          path: "/api/alerting/rule/{{ foreach.item[2] }}"
+
+      # 2b — Write enriched detection to index
+      - name: index_detection
+        type: elasticsearch.index
+        with:
+          index: rogue-alert-detections
+          document:
+            "@timestamp": "{{ foreach.item[1] }}"
+            rule.id: "{{ foreach.item[2] }}"
+            rule.name: "{{ foreach.item[3] }}"
+            rule.type: ".es-query"
+            rule.created_by: "{{ steps.get_rule.output.created_by }}"
+            rule.created_at: "{{ steps.get_rule.output.created_at }}"
+            rule.tags: "{{ steps.get_rule.output.tags }}"
+            rule.schedule: "{{ steps.get_rule.output.schedule.interval }}"
+            detection.duration_ms: "{{ foreach.item[4] }}"
+            detection.severity: "{{ foreach.item[5] }}"
+            detection.executions_in_window: "{{ foreach.item[0] }}"
+            detection.execution_time: "{{ foreach.item[1] }}"
+            detection.window_size_h: "{{ steps.get_rule.output.params.timeWindowSize }}"
+            detection.excludes_previous_runs: "{{ steps.get_rule.output.params.excludeHitsFromPreviousRun }}"
+            detection.result_size: "{{ steps.get_rule.output.params.size }}"
+            detection.threshold_ms: 1000
+            detection.source: "workflow"
 ```
-PUT kbn:/api/saved_objects/dashboard/ops-rogue-alert-hunter-dash
-<contents of dashboard_payload.json>
+
+**Workflow — remediation steps (not yet tested, `workflow.yaml`):**
+
+> ⚠️ Steps 2c and 2d below extend the validated workflow above. Add them inside the `process_detections` foreach after step 2b. Test in a non-production environment before enabling auto-disable.
+
+```yaml
+      # 2c — If CRITICAL: auto-disable rule + create case + send email
+      - name: handle_critical
+        type: if
+        condition: "foreach.item[5] : critical"
+        steps:
+          - name: disable_rule
+            type: kibana.request
+            with:
+              method: POST
+              path: "/api/alerting/rule/{{ foreach.item[2] }}/_disable"
+
+          - name: create_case
+            type: cases.createCase
+            with:
+              title: "Rogue Alert Auto-Disabled: {{ foreach.item[3] }}"
+              severity: critical
+              tags:
+                - rogue-alert
+                - auto-disabled
+
+          - name: send_email_critical
+            type: kibana.request
+            with:
+              method: POST
+              path: "/api/actions/connector/<your-email-connector-id>/_execute"
+              body:
+                params:
+                  to:
+                    - "ops-team@yourcompany.com"
+                  subject: "CRITICAL: Rogue Alert Auto-Disabled — {{ foreach.item[3] }}"
+                  message: |
+                    Rule {{ foreach.item[3] }} ({{ foreach.item[2] }}) has been
+                    automatically disabled. Max execution: {{ foreach.item[4] }}ms.
+                    Re-enable: POST /api/alerting/rule/{{ foreach.item[2] }}/_enable
+
+      # 2d — If WARNING: email only, no disable
+      - name: handle_warning
+        type: if
+        condition: "foreach.item[5] : warning"
+        steps:
+          - name: send_email_warning
+            type: kibana.request
+            with:
+              method: POST
+              path: "/api/actions/connector/<your-email-connector-id>/_execute"
+              body:
+                params:
+                  to:
+                    - "ops-team@yourcompany.com"
+                  subject: "WARNING: Slow Alert Rule — {{ foreach.item[3] }}"
+                  message: |
+                    Rule {{ foreach.item[3] }} took {{ foreach.item[4] }}ms.
+                    Rule has NOT been disabled — investigate if this persists.
 ```
 
-The payload includes Panel 1 (Detections Over Time) as a saved Lens object (`ops-rogue-detections-over-time`). Create this via `POST kbn:/api/saved_objects/lens/ops-rogue-detections-over-time` before importing the dashboard, then add it to the dashboard via Visualize Library. The legacy `histogram` visualization type does not render in Kibana 9.x.
+### Step 4 — Smoke test the Workflow
 
-### Step 7 — Open the dashboard
+After saving, click **Run** in the Workflow UI. Check the execution log — Step 1 should return your rogue rules, Step 2 should enrich and write them.
 
-Navigate to:
-```
-https://<your-kibana>/app/dashboards#/view/ops-rogue-alert-hunter-dash
-```
-
-Or: **Kibana → Dashboards → search `[OPS] ES Query Rogue Alert Hunter`**
-
----
-
-## Operational Queries
-
-### Who are the current offenders? (last 24h)
+Verify detections landed:
 
 ```json
 GET rogue-alert-detections/_search
 {
   "sort": [{ "@timestamp": { "order": "desc" } }],
-  "query": { "range": { "@timestamp": { "gte": "now-24h" } } },
-  "aggs": {
-    "by_rule": {
-      "terms": { "field": "rule.id", "size": 20 },
-      "aggs": {
-        "rule_name":    { "terms": { "field": "rule.name", "size": 1 } },
-        "created_by":   { "terms": { "field": "rule.created_by", "size": 1 } },
-        "max_duration": { "max": { "field": "detection.duration_ms" } },
-        "detections":   { "value_count": { "field": "detection.severity" } }
-      }
-    }
-  },
-  "size": 0
+  "size": 3,
+  "query": { "term": { "detection.source": "workflow" } }
 }
 ```
 
-### Duration trend for a specific rule (replace RULE_ID)
-
+Expected document:
 ```json
-GET .kibana-event-log*/_search
 {
-  "size": 0,
-  "query": {
-    "bool": {
-      "filter": [
-        { "term": { "event.provider": "alerting" } },
-        { "term": { "event.action": "execute" } },
-        { "range": { "@timestamp": { "gte": "now-6h" } } },
-        {
-          "nested": {
-            "path": "kibana.saved_objects",
-            "query": { "term": { "kibana.saved_objects.id": "RULE_ID" } }
-          }
-        }
-      ]
-    }
-  },
-  "aggs": {
-    "over_time": {
-      "date_histogram": { "field": "@timestamp", "fixed_interval": "5m" },
-      "aggs": {
-        "max_duration_ms": { "max": { "script": "doc['event.duration'].value / 1000000" } },
-        "avg_duration_ms": { "avg": { "script": "doc['event.duration'].value / 1000000" } }
-      }
-    }
-  }
+  "@timestamp": "2026-06-29T07:17:15.787Z",
+  "rule.id": "d387ad5c-76ff-4667-ae2d-c637b586e50b",
+  "rule.name": "rogue alert metrics 24h",
+  "rule.created_by": "2763457433",
+  "rule.tags": "rogue",
+  "rule.schedule": "1m",
+  "detection.duration_ms": "1101",
+  "detection.severity": "warning",
+  "detection.window_size_h": "24",
+  "detection.excludes_previous_runs": "false",
+  "detection.source": "workflow"
 }
 ```
 
-### Full rule health scorecard (all .es-query rules, last 24h)
+### Step 5 — Deploy the Lens saved objects
 
-```json
-GET .kibana-event-log*/_search
+The dashboard requires three Lens saved objects created before import:
+
+```
+POST kbn:/api/saved_objects/lens/ops-rogue-detections-over-time
+```
+→ See `devtools_dashboard.txt` Step 1
+
+```
+POST kbn:/api/saved_objects/lens/ops-tm-drift-over-time
+```
+→ See `devtools_correlation_panels.txt` Step 1
+
+```
+POST kbn:/api/saved_objects/lens/ops-alert-vs-tm-overlay
+```
+→ See `devtools_correlation_panels.txt` Step 2
+
+### Step 6 — Deploy the dashboard
+
+```
+POST kbn:/api/saved_objects/dashboard/ops-rogue-alert-hunter-dash
+```
+
+Replace the two data view IDs from Step 2 in `devtools_dashboard.txt`, then run it.
+
+After creating, open the dashboard → Edit → **Add panel → Add from library** → add the three Lens panels → Save.
+
+Open the 3 metric panels (Total, Critical, Warning) in the Lens editor and click **Save and return** on each — this clears any migration-added time range overrides so they respect the dashboard time picker.
+
+### Step 7 — Open the dashboard
+
+```
+https://<your-kibana>/app/dashboards#/view/ops-rogue-alert-hunter-dash
+```
+
+---
+
+## Operational Queries
+
+### Current offenders (last 24h)
+
+```
+POST /_query
 {
-  "size": 0,
-  "query": {
-    "bool": {
-      "filter": [
-        { "term": { "event.provider": "alerting" } },
-        { "term": { "event.action": "execute" } },
-        { "range": { "@timestamp": { "gte": "now-24h" } } },
-        {
-          "nested": {
-            "path": "kibana.saved_objects",
-            "query": { "term": { "kibana.saved_objects.type_id": ".es-query" } }
-          }
-        }
-      ]
-    }
-  },
-  "aggs": {
-    "by_rule": {
-      "nested": { "path": "kibana.saved_objects" },
-      "aggs": {
-        "rule_id": {
-          "terms": { "field": "kibana.saved_objects.id", "size": 50 },
-          "aggs": {
-            "metrics": {
-              "reverse_nested": {},
-              "aggs": {
-                "p95_ms": { "percentiles": { "script": "doc['event.duration'].value / 1000000", "percents": [50, 95] } },
-                "max_ms": { "max": { "script": "doc['event.duration'].value / 1000000" } },
-                "count":  { "value_count": { "field": "event.duration" } }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  "query": "FROM .kibana-event-log* | WHERE @timestamp >= NOW() - 24 hours | WHERE event.provider == \"alerting\" | WHERE event.action == \"execute\" | WHERE event.duration > 1000000000 | STATS max_duration_ns = MAX(event.duration), execution_count = COUNT(*) BY rule_id = rule.id, rule_name = rule.name | EVAL max_duration_ms = max_duration_ns / 1000000 | SORT max_duration_ms DESC"
 }
 ```
 
-### Cancel a running task (emergency)
+### Task Manager drift (last 24h)
 
 ```
-POST _tasks/<node-id>:<task-id>/_cancel
+POST /_query
+{
+  "query": "FROM .kibana-event-log* | WHERE @timestamp >= NOW() - 24 hours | WHERE event.provider == \"taskManager\" | WHERE event.action == \"task-run\" | STATS p95_ns = PERCENTILE(event.duration, 95), max_ns = MAX(event.duration), count = COUNT(*) BY bucket = DATE_TRUNC(5 minutes, @timestamp) | EVAL p95_ms = p95_ns / 1000000, max_ms = max_ns / 1000000 | SORT bucket ASC"
+}
 ```
 
-Get the task ID from:
-```
-GET _tasks?actions=indices:data/read/search&detailed=true&group_by=parents
-```
-
-Look for tasks with `X-Opaque-Id` containing `alerting:.es-query`.
-
-### Disable a specific rule (by ID)
+### Re-enable a disabled rule
 
 ```
-POST kbn:/api/alerting/rule/<rule-id>/disable
+POST kbn:/api/alerting/rule/<rule-id>/_enable
+```
+
+### Disable a rule manually
+
+```
+POST kbn:/api/alerting/rule/<rule-id>/_disable
 ```
 
 ---
 
 ## Threshold Tuning
 
-The default thresholds (`warning: >1s`, `critical: >5s`) are calibrated for a busy production cluster where legitimate Fleet Agent rules run at 60–130ms. Tune based on your cluster:
+The default thresholds (`warning: >1s`, `critical: >5s`) suit a busy production cluster where legitimate Fleet Agent rules run at 60–130ms.
 
-| Cluster type | Recommended warning threshold | Recommended critical threshold |
+To change, edit the ES|QL query in the Workflow Step 1:
+
+```
+| EVAL
+    max_duration_ms = max_duration_ns / 1000000,
+    severity = CASE(max_duration_ns >= 5000000000, "critical", "warning")
+    --                                 ^^^^^^^^^^
+    --                         change to 2000000000 for 2s critical threshold
+```
+
+| Cluster type | Warning threshold | Critical threshold |
 |---|---|---|
 | Small / low data volume | 500ms | 2,000ms |
 | Medium production | 1,000ms (default) | 5,000ms (default) |
 | Large / high cardinality | 2,000ms | 10,000ms |
 
-To change thresholds, update the Watcher transform script:
-
-```painless
-// Change these two values:
-def severity = maxDurationMs >= 5000 ? 'critical' : 'warning';
-//                             ^^^^
-// and in the doc:
-'detection.threshold_ms': severity == 'critical' ? 5000 : 1000,
-//                                                 ^^^^    ^^^^
-```
-
-Then re-PUT the Watcher with the updated script.
-
 ---
 
-## Watcher Management
+## Workflow Management
 
-```bash
-# Check Watcher status
-GET _watcher/watch/ops-rogue-alert-hunter
+```
+# View execution history
+Stack Management → Workflows → OPS - Rogue Alert Detector → Executions tab
 
-# Trigger manually
-POST _watcher/watch/ops-rogue-alert-hunter/_execute
-{ "ignore_condition": false, "action_modes": { "index_detections": "execute", "log_detections": "execute" } }
+# Disable workflow (pause without deleting)
+Stack Management → Workflows → toggle Enabled off
 
-# Pause (deactivate) without deleting
-POST _watcher/watch/ops-rogue-alert-hunter/_deactivate
-
-# Resume
-POST _watcher/watch/ops-rogue-alert-hunter/_activate
-
-# Remove entirely
-DELETE _watcher/watch/ops-rogue-alert-hunter
+# Run manually
+Stack Management → Workflows → Run button
 ```
 
 ---
@@ -751,12 +631,13 @@ DELETE _watcher/watch/ops-rogue-alert-hunter
 
 | Limitation | Detail |
 |---|---|
-| System index deprecation | `.kibana-event-log*` is a system index. Direct access generates a deprecation warning in ES 9.x logs. Safe in 9.x; migrate to Kibana Event Log API in future major versions |
-| 5-minute detection window | Rules that complete before the Watcher runs may be missed in a single cycle. Use the `.kibana-event-log*` historical queries for full coverage |
-| No auto-remediation | The Watcher detects and reports — it never disables or cancels rules. Human review is required before any action. This is intentional |
-| `.es-query` rules only | Other rule types (`slo.rules.burnRate`, `.index-threshold`, ML rules) are not in scope. Extend by modifying the `type_id` filter |
-| Watcher licence | Requires Elastic Platinum or Enterprise licence |
-| Duration alone is not causation | A rule that is slow due to cluster degradation (GC, hot threads) will also be detected. Correlate with node CPU and hot threads before blaming the rule |
+| System index deprecation | `.kibana-event-log*` direct access generates a deprecation warning in 9.x. Safe currently; Elastic will provide an official Event Log API in a future version |
+| Numeric fields stored as strings | Workflow Liquid templating wraps all values in quotes. `detection.duration_ms` is stored as `"1101"` not `1101`. Does not affect dashboard display but breaks numeric aggregations on that field |
+| 5-minute detection window | Rules that happen to run fast in a given window won't be detected that cycle. The next cycle will catch them if they're consistently slow |
+| `.es-query` rules only | Other rule types not in scope. Extend by modifying the ES|QL filters |
+| No auto-remediation for warnings | Warning-tier rules are email-notified only. Human review required before disabling |
+| Critical auto-disable risk | A legitimately slow rule (e.g. a security detection scanning a large index) may be disabled. Add a `rule.tags` whitelist check before the disable step if needed |
+| Elastic Cloud monitoring | Cluster CPU and node stats are stored in a separate monitoring deployment on Elastic Cloud. Use Stack Monitoring UI for CPU correlation. Task Manager drift from `.kibana-event-log*` is the available in-cluster signal |
 
 ---
 
@@ -765,18 +646,21 @@ DELETE _watcher/watch/ops-rogue-alert-hunter
 | File | Purpose |
 |---|---|
 | `README.md` | This document |
-| `dashboard creation steps` | Full Kibana dashboard saved object — 7 panels. Panel 1 (Detections Over Time) references a saved Lens object. Replace data view IDs before deploying. |
-| `watcher.json` | Standalone Watcher definition for CI/CD or IaC deployment |
+| `workflow.yaml` | Complete Elastic Workflow definition — detection, enrichment, auto-disable, case creation, email notification |
+| `workflow_minimal.yaml` | Detection and write only — use for initial deployment and testing before adding remediation |
+| `dashboard_payload.json` | Kibana dashboard saved object — replace data view IDs before deploying |
+| `devtools_dashboard.txt` | Dev Console commands — Step 1 creates Lens object, Step 2 creates dashboard |
+| `devtools_correlation_panels.txt` | Dev Console commands — creates Task Manager drift and Alert vs TM Lens objects |
 
 ---
 
 ## Test Cases
 
-To validate detection after deployment, create these rules in **Stack Management → Rules → Create rule → Elasticsearch query**:
+Create these rules in **Stack Management → Rules → Create rule → Elasticsearch query** to validate detection:
 
 ### Test 1 — Warning tier
 - **Name:** `_TEST_ROGUE_Warning_Tier`
-- **Index:** `logs-*`
+- **Index:** `logs-*` or `metrics-*`
 - **Query:** empty (match_all)
 - **Window:** 24 hours
 - **Schedule:** 1 minute
@@ -784,23 +668,22 @@ To validate detection after deployment, create these rules in **Stack Management
 
 ### Test 2 — Critical tier
 - **Name:** `_TEST_ROGUE_Critical_Tier`
-- **Index:** `logs-*`
+- **Index:** `logs-*` or `metrics-*`
 - **Query:** empty (match_all)
 - **Window:** 7 days
 - **Schedule:** 1 minute
 - **Exclude previous runs:** unchecked
 
-### Test 3 — Control (should NOT appear in detections if cluster is fast)
-- **Name:** `_TEST_Legit_Control`
+### Test 3 — Control (should be slow but demonstrates duration-only detection)
+- **Name:** `_TEST_Legit_Looking_Rule`
+- **Tags:** `monitoring, ops`
 - **Index:** `logs-*`
-- **Query:** specific filter (not empty)
+- **Query:** empty
 - **Window:** 5 minutes
-- **Schedule:** 5 minutes
-- **Exclude previous runs:** checked
+- **Schedule:** 1 minute
+- **Exclude previous runs:** unchecked
 
-Wait 5 minutes, trigger the Watcher manually, then verify Test 1 and 2 appear in `rogue-alert-detections`.
-
-> **Note:** Test 3 may still appear if the underlying `logs-*` index is large — even a narrow window over a large dataset can exceed 1 second. This is correct detection behaviour, not a false positive. Duration is an honest signal: if the query is slow, it is consuming resources.
+Wait 5 minutes, run the Workflow manually, then verify all three appear in `rogue-alert-detections`. The legitimately-named Test 3 being detected proves detection is purely duration-based.
 
 ---
 
@@ -809,12 +692,10 @@ Wait 5 minutes, trigger the Watcher manually, then verify Test 1 and 2 appear in
 | Metric | Normal | Warning | Critical |
 |---|---|---|---|
 | Alert task duration | < 1s | 1–5s | > 5s |
-| Task Manager drift (p99) | < 1s | 1–5s | > 10s |
-| Search thread pool queue | 0 | 1–10 | > 10 |
-| Search rejections (cumulative) | 0 | Any | Increasing |
+| Task Manager p95 | < 500ms | 500ms–2s | > 2s |
+| TM schedule delay | < 100ms | 100ms–1s | > 1s |
+| Rule Success Ratio | 100% | < 100% | Dropping |
 
 ---
 
-*Tested on Elasticsearch 9.2.2 / Kibana 9.2.2. Compatible with 9.x.*
-
-
+*Tested on Elasticsearch 9.4.1 / Kibana 9.4.1 — Elastic Cloud (us-east-2). Elastic Workflows GA from 9.4.*
