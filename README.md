@@ -8,7 +8,7 @@
 
 Kibana alerting rules are invisible to the cluster until they cause damage. A single poorly-configured `.es-query` rule — running `match_all` over 24 hours of data every minute with no filters and `excludeHitsFromPreviousRun: false` — can consume enough search thread pool capacity to degrade every other query on the cluster. By the time you notice CPU saturation, the rule has been running for days.
 
-The challenge: you cannot detect a rogue alert by looking at its name or tags. A rule named `_VALIDATE_P37_TwoXX` tagged `_DIAG_TEMP` is just as dangerous as one tagged `monitoring, ops`. What matters is **how long it takes to execute**.
+The challenge: you cannot detect a rogue alert by looking at its name or tags.. What matters is **how long it takes to execute & How frequent the alerts executes and WHAT is the alerts looking for?**.
 
 ---
 
